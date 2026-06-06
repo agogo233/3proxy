@@ -17,43 +17,35 @@ jobs:
       matrix:
         target:
           - ubuntu-latest
-          - ubuntu-24.04-arm
-          - macos-15
           - windows-2022
     runs-on: ${{ matrix.target }}
     steps:
     - uses: actions/checkout@v6
-#    - name: configure
-#      run: ./configure
     - name: Linux libraries
-      if: ${{ startsWith(matrix.target, 'ubuntu') }}
+      if: startsWith(matrix.target, 'ubuntu')
       run: sudo apt install libssl-dev libpam-dev libpcre2-dev
-    - name: Mac libraries
-      if: ${{ startsWith(matrix.target, 'macos') }}
-      run: brew install pcre2
     - name: install Windows libraries
-      if: ${{ startsWith(matrix.target, 'windows') }}
-      run: vcpkg install pcre2:x64-windows 
-    - name: make with CMake POSIX
-      if: ${{ ! startsWith(matrix.target, 'windows') }}
+      if: startsWith(matrix.target, 'windows')
+      run: vcpkg install pcre2:x64-windows
+    - name: Configure, build and install (POSIX)
+      if: "!startsWith(matrix.target, 'windows')"
       run: |
-       mkdir build
-       cd build
-       cmake ..
+       mkdir build && cd build
+       cmake .. -DCMAKE_BUILD_TYPE=Release
        cmake --build .
-       mkdir ~/3proxy
-       DESTDIR=~/3proxy cmake --install .
-       cd .. && rm -rf build/
-    - name: make with CMake Win
-      if: ${{ startsWith(matrix.target, 'windows') }}
+       DESTDIR=${{ github.workspace }}/install cmake --install .
+    - name: Configure, build and install (Windows)
+      if: startsWith(matrix.target, 'windows')
       shell: cmd
       run: |
-       mkdir build
-       cd build
+       mkdir build && cd build
        set "LIB=%LIB%;c:/program files/openssl/lib/VC/x64/MT;c:/vcpkg/installed/x64-windows/lib"
        set "INCLUDE=%INCLUDE%;c:/program files/openssl/include;c:/vcpkg/installed/x64-windows/include"
-       cmake ..
-       dir
-       cmake --build .
-       cd ..
-       rmdir /s /q build
+       cmake .. -DCMAKE_BUILD_TYPE=Release
+       cmake --build . --config Release
+       cmake --install . --config Release --prefix ${{ github.workspace }}\install
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: 3proxy-${{ matrix.target }}
+        path: install/
