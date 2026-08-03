@@ -46,11 +46,12 @@ endif()
 
 # Options
 option(3PROXY_BUILD_SHARED "Build shared libraries for plugins" ON)
-option(3PROXY_USE_OPENSSL "Enable TLS/SSL support (requires OpenSSL)" ON)
+option(3PROXY_USE_WOLFSSL "Enable TLS/SSL support via wolfSSL (preferred when detected)" ON)
+option(3PROXY_USE_OPENSSL "Enable TLS/SSL support via OpenSSL (fallback when wolfSSL unavailable)" ON)
 option(3PROXY_USE_PCRE2 "Enable PCRE2 regex filtering" ON)
 option(3PROXY_USE_PAM "Enable PAM/PamAuth" ON)
 option(3PROXY_USE_ODBC "Enable ODBC support (Unix only, always ON on Windows)" OFF)
-option(3PROXY_USE_SPLICE "Use Linux splice() for zero-copy (Linux only)" ON)
+option(3PROXY_USE_SPLICE "Build Linux splice() support, slower than read/write for most traffic (Linux only)" OFF)
 option(3PROXY_USE_POLL "Use poll() instead of select() (Unix only)" ON)
 option(3PROXY_USE_WSAPOLL "Use WSAPoll instead of select() (Windows only)" ON)
 option(3PROXY_USE_NETFILTER "Enable Linux netfilter support (Linux only)" ON)
@@ -69,6 +70,7 @@ option(3PROXY_BUILD_NONE   "Do not build standalone binaries"   OFF)
 option(3PROXY_BUILD_PROXY  "Build standalone proxy binary"  ON)
 option(3PROXY_BUILD_SOCKS  "Build standalone socks binary"  ON)
 option(3PROXY_BUILD_POP3P  "Build standalone pop3p binary"  ON)
+option(3PROXY_BUILD_IMAPP  "Build standalone imapp binary"  ON)
 option(3PROXY_BUILD_SMTPP  "Build standalone smtpp binary"  ON)
 option(3PROXY_BUILD_FTPPR  "Build standalone ftppr binary"  ON)
 option(3PROXY_BUILD_TCPPM  "Build standalone tcppm binary"  ON)
@@ -76,7 +78,7 @@ option(3PROXY_BUILD_UDPPM  "Build standalone udppm binary"  ON)
 option(3PROXY_BUILD_TLSPR  "Build standalone tlspr binary"  ON)
 
 if(3PROXY_BUILD_NONE)
-    foreach(_M PROXY SOCKS POP3P SMTPP FTPPR TCPPM UDPPM TLSPR)
+    foreach(_M PROXY SOCKS POP3P IMAPP SMTPP FTPPR TCPPM UDPPM TLSPR)
         set(3PROXY_BUILD_${_M} OFF)
     endforeach()
 endif()
@@ -234,6 +236,12 @@ else()
     )
 endif()
 
+# Unix domain sockets off: NO_UN also undefines WITH_UN if it arrives from
+# elsewhere, e.g. CFLAGS
+if(NOT 3PROXY_USE_UNIX_SOCKETS)
+    add_compile_definitions(NO_UN)
+endif()
+
 # Common definitions
 if(WIN32)
     # Windows: use WSAPOLL
@@ -253,17 +261,38 @@ endif()
 
 # Find dependencies
 
-# OpenSSL
+# TLS/SSL backend: prefer wolfSSL when detected, fall back to OpenSSL.
+set(3PROXY_SSL_ENABLED FALSE)
+set(3PROXY_SSL_WOLFSSL FALSE)
 set(OPENSSL_FOUND FALSE)
-if(3PROXY_USE_OPENSSL)
+set(WOLFSSL_FOUND FALSE)
+
+if(3PROXY_USE_WOLFSSL)
+    find_path(WOLFSSL_INCLUDE_DIR NAMES wolfssl/options.h wolfssl/ssl.h)
+    find_library(WOLFSSL_LIBRARIES NAMES wolfssl)
+    if(WOLFSSL_INCLUDE_DIR AND WOLFSSL_LIBRARIES)
+        set(WOLFSSL_FOUND TRUE)
+        set(3PROXY_SSL_ENABLED TRUE)
+        set(3PROXY_SSL_WOLFSSL TRUE)
+        add_compile_definitions(WITH_SSL WITH_WOLFSSL)
+        message(STATUS "wolfSSL found: ${WOLFSSL_LIBRARIES} (preferred backend)")
+    else()
+        message(STATUS "wolfSSL not found, falling back to OpenSSL if enabled")
+    endif()
+endif()
+
+if(NOT 3PROXY_SSL_ENABLED AND 3PROXY_USE_OPENSSL)
     find_package(OpenSSL REQUIRED)
     if(OpenSSL_FOUND)
         set(OPENSSL_FOUND TRUE)
+        set(3PROXY_SSL_ENABLED TRUE)
         add_compile_definitions(WITH_SSL)
         message(STATUS "OpenSSL found: ${OPENSSL_VERSION}")
     endif()
-else()
-    message(STATUS "OpenSSL disabled by user request")
+elseif(NOT 3PROXY_SSL_ENABLED)
+    message(STATUS "SSL disabled (neither wolfSSL nor OpenSSL enabled/found)")
+elseif(3PROXY_SSL_WOLFSSL)
+    message(STATUS "OpenSSL skipped (wolfSSL in use)")
 endif()
 
 # PCRE2
@@ -305,8 +334,9 @@ if(ODBC_FOUND)
     add_compile_definitions(WITH_ODBC)
 endif()
 
-# Set NORADIUS if OpenSSL is not available (RADIUS requires MD5 from OpenSSL)
-if(NOT OPENSSL_FOUND)
+# Set NORADIUS if no SSL backend is available (RADIUS MD5 uses bundled md5, but
+# keep the historical gate tied to SSL availability).
+if(NOT 3PROXY_SSL_ENABLED)
     add_compile_definitions(NORADIUS)
 endif()
 
@@ -328,10 +358,8 @@ set(3PROXY_CORE_SOURCES
     src/stringtable.c
 )
 
-# BLAKE2 source for 3proxy_crypt
-set(MD_SOURCES
-    src/libs/blake2b-ref.c
-)
+# Bundled hash implementations (md4.c, md5.c, blake2b-ref.c) self-disable
+# via preprocessor guards when wolfSSL provides them natively.
 
 # ============================================================================
 # Object libraries for common sources (shared between executables)
@@ -350,6 +378,14 @@ target_include_directories(common_obj PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 add_library(base64_obj OBJECT src/base64.c)
 target_include_directories(base64_obj PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
+# mdhash object library. md4.c/md5.c self-disable via NO_MD4/NO_MD5 guards
+# when wolfSSL provides them; always compiled for fallback.
+add_library(mdhash_obj OBJECT src/mdhash.c src/libs/md4.c src/libs/md5.c src/libs/blake2b-ref.c)
+target_include_directories(mdhash_obj PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+if(3PROXY_SSL_WOLFSSL)
+    target_include_directories(mdhash_obj PRIVATE ${WOLFSSL_INCLUDE_DIR})
+endif()
+
 # ============================================================================
 # Object libraries for 3proxy (compiled WITHOUT WITHMAIN)
 # These are used by the main 3proxy executable
@@ -359,6 +395,7 @@ target_include_directories(base64_obj PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 add_library(srv_modules OBJECT
     src/proxy.c
     src/pop3p.c
+    src/imapp.c
     src/smtpp.c
     src/ftppr.c
     src/tcppm.c
@@ -394,8 +431,12 @@ target_include_directories(ftp_obj PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 # 3proxy_crypt object for 3proxy (without WITHMAIN)
 add_library(3proxy_crypt_obj OBJECT src/3proxy_crypt.c)
 target_include_directories(3proxy_crypt_obj PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-if(OpenSSL_FOUND)
-    target_include_directories(3proxy_crypt_obj PRIVATE ${OPENSSL_INCLUDE_DIR})
+if(3PROXY_SSL_ENABLED)
+    if(3PROXY_SSL_WOLFSSL)
+        target_include_directories(3proxy_crypt_obj PRIVATE ${WOLFSSL_INCLUDE_DIR})
+    else()
+        target_include_directories(3proxy_crypt_obj PRIVATE ${OPENSSL_INCLUDE_DIR})
+    endif()
 endif()
 
 # ============================================================================
@@ -411,12 +452,12 @@ add_executable(3proxy
     $<TARGET_OBJECTS:common_obj>
     $<TARGET_OBJECTS:udpsockmap_obj>
     $<TARGET_OBJECTS:base64_obj>
+    $<TARGET_OBJECTS:mdhash_obj>
     $<TARGET_OBJECTS:ftp_obj>
     $<TARGET_OBJECTS:3proxy_crypt_obj>
 )
-target_sources(3proxy PRIVATE ${MD_SOURCES})
 
-if(OpenSSL_FOUND)
+if(3PROXY_SSL_ENABLED)
     target_sources(3proxy PRIVATE src/ssllib.c src/ssl.c)
 endif()
 
@@ -428,8 +469,12 @@ target_include_directories(3proxy PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/libs
 )
-if(OpenSSL_FOUND)
-    target_include_directories(3proxy PRIVATE ${OPENSSL_INCLUDE_DIR})
+if(3PROXY_SSL_ENABLED)
+    if(3PROXY_SSL_WOLFSSL)
+        target_include_directories(3proxy PRIVATE ${WOLFSSL_INCLUDE_DIR})
+    else()
+        target_include_directories(3proxy PRIVATE ${OPENSSL_INCLUDE_DIR})
+    endif()
 endif()
 if(PCRE2_FOUND)
     target_include_directories(3proxy PRIVATE ${PCRE2_INCLUDE_DIRS})
@@ -445,10 +490,16 @@ if(ODBC_FOUND)
     endif()
 endif()
 
-# OpenSSL linking
-if(OpenSSL_FOUND)
-    if(3PROXY_STATIC_LINK)
-        # Will be linked statically below (if static libraries are found)
+# SSL linking
+if(3PROXY_SSL_ENABLED)
+    if(3PROXY_SSL_WOLFSSL)
+        if(3PROXY_STATIC_LINK)
+            # Will be linked statically below (if static library is found)
+        else()
+            target_link_libraries(3proxy PRIVATE ${WOLFSSL_LIBRARIES})
+        endif()
+    elseif(3PROXY_STATIC_LINK)
+        # OpenSSL static linking handled below
     else()
         target_link_libraries(3proxy PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     endif()
@@ -465,14 +516,19 @@ if(PCRE2_FOUND)
     endif()
 endif()
 
-# Static linking of OpenSSL and PCRE2 (when option is enabled)
-if(3PROXY_STATIC_LINK AND (OpenSSL_FOUND OR PCRE2_FOUND))
+# Static linking of SSL backend and PCRE2 (when option is enabled)
+if(3PROXY_STATIC_LINK AND ((3PROXY_SSL_ENABLED AND NOT 3PROXY_SSL_WOLFSSL) OR (3PROXY_SSL_WOLFSSL) OR PCRE2_FOUND))
     set(_saved_cmake_find_library_suffixes ${CMAKE_FIND_LIBRARY_SUFFIXES})
     set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
 
     set(_static_libs "")
 
-    if(OpenSSL_FOUND)
+    if(3PROXY_SSL_WOLFSSL)
+        find_library(_wolfssl_static_lib NAMES wolfssl)
+        if(_wolfssl_static_lib)
+            list(APPEND _static_libs ${_wolfssl_static_lib})
+        endif()
+    elseif(OpenSSL_FOUND)
         find_library(_ssl_static_lib ssl)
         find_library(_crypto_static_lib crypto)
         if(_ssl_static_lib AND _crypto_static_lib)
@@ -491,10 +547,12 @@ if(3PROXY_STATIC_LINK AND (OpenSSL_FOUND OR PCRE2_FOUND))
 
     if(_static_libs)
         target_link_libraries(3proxy PRIVATE -Wl,-Bstatic ${_static_libs} -Wl,-Bdynamic)
-        message(STATUS "Static linking enabled for OpenSSL/PCRE2")
+        message(STATUS "Static linking enabled for SSL backend/PCRE2")
     else()
         message(WARNING "3PROXY_STATIC_LINK is ON but static libraries not found, falling back to dynamic")
-        if(OpenSSL_FOUND)
+        if(3PROXY_SSL_WOLFSSL)
+            target_link_libraries(3proxy PRIVATE ${WOLFSSL_LIBRARIES})
+        elseif(OpenSSL_FOUND)
             target_link_libraries(3proxy PRIVATE OpenSSL::SSL OpenSSL::Crypto)
         endif()
         if(PCRE2_FOUND)
@@ -520,33 +578,55 @@ endif()
 add_executable(3proxy_crypt
     src/3proxy_crypt.c
     $<TARGET_OBJECTS:base64_obj>
+    $<TARGET_OBJECTS:mdhash_obj>
 )
-target_sources(3proxy_crypt PRIVATE ${MD_SOURCES})
 target_compile_definitions(3proxy_crypt PRIVATE WITHMAIN)
 target_include_directories(3proxy_crypt PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/libs
 )
-if(OpenSSL_FOUND)
-    target_include_directories(3proxy_crypt PRIVATE ${OPENSSL_INCLUDE_DIR})
+if(3PROXY_SSL_ENABLED)
+    if(3PROXY_SSL_WOLFSSL)
+        target_include_directories(3proxy_crypt PRIVATE ${WOLFSSL_INCLUDE_DIR})
+    else()
+        target_include_directories(3proxy_crypt PRIVATE ${OPENSSL_INCLUDE_DIR})
+    endif()
 endif()
 target_link_libraries(3proxy_crypt PRIVATE Threads::Threads)
-if(OpenSSL_FOUND)
-    if(3PROXY_STATIC_LINK)
-        set(_saved_cmake_find_library_suffixes ${CMAKE_FIND_LIBRARY_SUFFIXES})
-        set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
-        find_library(_ssl_static_lib ssl)
-        find_library(_crypto_static_lib crypto)
-        set(CMAKE_FIND_LIBRARY_SUFFIXES ${_saved_cmake_find_library_suffixes})
-        if(_ssl_static_lib AND _crypto_static_lib)
-            target_link_libraries(3proxy_crypt PRIVATE -Wl,-Bstatic ${_ssl_static_lib} ${_crypto_static_lib} -Wl,-Bdynamic)
-            message(STATUS "3proxy_crypt: static OpenSSL")
+if(3PROXY_SSL_ENABLED)
+    if(3PROXY_SSL_WOLFSSL)
+        if(3PROXY_STATIC_LINK)
+            set(_saved_cmake_find_library_suffixes ${CMAKE_FIND_LIBRARY_SUFFIXES})
+            set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
+            find_library(_wolfssl_static_lib_c NAMES wolfssl)
+            set(CMAKE_FIND_LIBRARY_SUFFIXES ${_saved_cmake_find_library_suffixes})
+            if(_wolfssl_static_lib_c)
+                target_link_libraries(3proxy_crypt PRIVATE -Wl,-Bstatic ${_wolfssl_static_lib_c} -Wl,-Bdynamic)
+                message(STATUS "3proxy_crypt: static wolfSSL")
+            else()
+                message(WARNING "3PROXY_STATIC_LINK is ON but static wolfSSL not found, using dynamic")
+                target_link_libraries(3proxy_crypt PRIVATE ${WOLFSSL_LIBRARIES})
+            endif()
         else()
-            message(WARNING "3PROXY_STATIC_LINK is ON but static OpenSSL not found, using dynamic")
-            target_link_libraries(3proxy_crypt PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+            target_link_libraries(3proxy_crypt PRIVATE ${WOLFSSL_LIBRARIES})
         endif()
     else()
-        target_link_libraries(3proxy_crypt PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+        if(3PROXY_STATIC_LINK)
+            set(_saved_cmake_find_library_suffixes ${CMAKE_FIND_LIBRARY_SUFFIXES})
+            set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
+            find_library(_ssl_static_lib ssl)
+            find_library(_crypto_static_lib crypto)
+            set(CMAKE_FIND_LIBRARY_SUFFIXES ${_saved_cmake_find_library_suffixes})
+            if(_ssl_static_lib AND _crypto_static_lib)
+                target_link_libraries(3proxy_crypt PRIVATE -Wl,-Bstatic ${_ssl_static_lib} ${_crypto_static_lib} -Wl,-Bdynamic)
+                message(STATUS "3proxy_crypt: static OpenSSL")
+            else()
+                message(WARNING "3PROXY_STATIC_LINK is ON but static OpenSSL not found, using dynamic")
+                target_link_libraries(3proxy_crypt PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+            endif()
+        else()
+            target_link_libraries(3proxy_crypt PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+        endif()
     endif()
 endif()
 if("${3PROXY_BINARY_PREFIX}" STREQUAL "")
@@ -556,7 +636,7 @@ else()
 endif()
 
 # Build standalone proxy executables
-foreach(PROXY_NAME proxy socks pop3p smtpp ftppr tcppm udppm tlspr)
+foreach(PROXY_NAME proxy socks pop3p imapp smtpp ftppr tcppm udppm tlspr)
     string(TOUPPER "${PROXY_NAME}" _MODULE_OPT)
     if(NOT 3PROXY_BUILD_${_MODULE_OPT})
         continue()
@@ -607,7 +687,7 @@ foreach(PROXY_NAME proxy socks pop3p smtpp ftppr tcppm udppm tlspr)
         target_link_libraries(${PROXY_NAME} PRIVATE ${WINDOWS_LIBS})
     endif()
 
-    if(PROXY_NAME STREQUAL "proxy" OR PROXY_NAME STREQUAL "smtpp")
+    if(PROXY_NAME STREQUAL "proxy" OR PROXY_NAME STREQUAL "smtpp" OR PROXY_NAME STREQUAL "imapp")
         target_sources(${PROXY_NAME} PRIVATE $<TARGET_OBJECTS:base64_obj>)
     endif()
 
@@ -651,7 +731,7 @@ install(TARGETS 3proxy 3proxy_crypt
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 
-foreach(PROXY_NAME proxy socks pop3p smtpp ftppr tcppm udppm tlspr)
+foreach(PROXY_NAME proxy socks pop3p imapp smtpp ftppr tcppm udppm tlspr)
     string(TOUPPER "${PROXY_NAME}" _MODULE_OPT)
     if(3PROXY_BUILD_${_MODULE_OPT})
         install(TARGETS ${PROXY_NAME}
@@ -661,16 +741,18 @@ foreach(PROXY_NAME proxy socks pop3p smtpp ftppr tcppm udppm tlspr)
 endforeach()
 
 # Install plugins
-file(GLOB PLUGINFILES "${PLUGIN_OUTPUT_DIR}/*${PLUGIN_SUFFIX}")
+# Use install(DIRECTORY ... FILES_MATCHING) so the glob resolves at install
+# time, after plugin targets have been built. A configure-time file(GLOB)
+# would run before any plugin exists and install nothing.
 if(WIN32)
-    install(FILES
-        ${PLUGINFILES}
+    install(DIRECTORY ${PLUGIN_OUTPUT_DIR}/
         DESTINATION ${CMAKE_INSTALL_BINDIR}
+        FILES_MATCHING PATTERN "*${PLUGIN_SUFFIX}"
     )
 else()
-    install(FILES
-        ${PLUGINFILES}
+    install(DIRECTORY ${PLUGIN_OUTPUT_DIR}/
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/3proxy
+        FILES_MATCHING PATTERN "*${PLUGIN_SUFFIX}"
     )
 endif()
 
@@ -812,7 +894,7 @@ if(NOT WIN32)
         )
     endif()
     # Module man pages — installed with binary prefix only if module is built
-    foreach(_MAN proxy socks pop3p smtpp ftppr tcppm udppm tlspr)
+    foreach(_MAN proxy socks pop3p imapp smtpp ftppr tcppm udppm tlspr)
         string(TOUPPER "${_MAN}" _MODULE_OPT)
         if(3PROXY_BUILD_${_MODULE_OPT})
             set(_MAN_SRC "${CMAKE_CURRENT_SOURCE_DIR}/man/${_MAN}.8")
@@ -836,7 +918,8 @@ message(STATUS "  Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "")
 message(STATUS "  Options:")
 message(STATUS "    BUILD_SHARED:    ${3PROXY_BUILD_SHARED}")
-message(STATUS "    USE_OPENSSL:     ${3PROXY_USE_OPENSSL}")
+message(STATUS "    USE_WOLFSSL:    ${3PROXY_USE_WOLFSSL}")
+message(STATUS "    USE_OPENSSL:    ${3PROXY_USE_OPENSSL}")
 message(STATUS "    USE_PCRE2:       ${3PROXY_USE_PCRE2}")
 message(STATUS "    USE_PAM:         ${3PROXY_USE_PAM}")
 message(STATUS "    USE_ODBC:        ${3PROXY_USE_ODBC}")
@@ -853,6 +936,7 @@ if(WIN32)
 endif()
 message(STATUS "")
 message(STATUS "  Libraries found:")
+message(STATUS "    wolfSSL: ${WOLFSSL_FOUND}")
 message(STATUS "    OpenSSL: ${OPENSSL_FOUND}")
 message(STATUS "    PCRE2:   ${PCRE2_FOUND}")
 message(STATUS "    PAM:     ${PAM_FOUND}")
@@ -862,7 +946,7 @@ message(STATUS "  Plugins to build: ${ALL_PLUGINS}")
 message(STATUS "")
 message(STATUS "  Standalone modules:")
 message(STATUS "    Binary prefix:   \"${3PROXY_BINARY_PREFIX}\"")
-foreach(_M proxy socks pop3p smtpp ftppr tcppm udppm tlspr)
+foreach(_M proxy socks pop3p imapp smtpp ftppr tcppm udppm tlspr)
     string(TOUPPER "${_M}" _MO)
     message(STATUS "    BUILD_${_MO}: ${3PROXY_BUILD_${_MO}}")
 endforeach()

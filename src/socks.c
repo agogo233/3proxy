@@ -53,7 +53,6 @@ void * sockschild(struct clientparam* param) {
  int ver=0;
  int havepass = 0;
  PROXYSOCKADDRTYPE sin;
- int len;
 
 
  param->service = S_SOCKS;
@@ -212,19 +211,7 @@ void * sockschild(struct clientparam* param) {
 	 param->operation = command == 2?BIND:UDPASSOC;
 	 if(command == 2){
 		if ((param->remsock=param->srv->so._socket(param->sostate, SASOCK(&param->req), SOCK_STREAM, IPPROTO_TCP)) == INVALID_SOCKET) {RETURN (11);}
-#ifdef REUSE
-		{
-			int opt;
-#ifdef SO_REUSEADDR
-			opt = 1;
-			param->srv->so._setsockopt(param->sostate, param->remsock, SOL_SOCKET, SO_REUSEADDR, (unsigned char *)&opt, sizeof(int));
-#endif
-#ifdef SO_REUSEPORT
-			opt = 1;
-			param->srv->so._setsockopt(param->sostate, param->remsock, SOL_SOCKET, SO_REUSEPORT, (unsigned char *)&opt, sizeof(int));
-#endif
-		}
-#endif
+		setopts(param->remsock, param->srv->lissockopts);
 	 }
 	 break;
 
@@ -385,9 +372,8 @@ fflush(stderr);
 		switch(command) {
 			case 1:
 				if(param->redirectfunc){
-					void *ret = (*param->redirectfunc)(param);
 					if(buf)free(buf);
-					return ret;
+					return (void *)param->redirectfunc;
 				}
 				param->res = mapsocket(param, conf.timeouts[CONNECTION_L]);
 				break;
@@ -467,7 +453,6 @@ fflush(stderr);
 	 dolog(param, buf);
 	 free(buf);
  }
- freeparam(param);
  return (NULL);
 }
 

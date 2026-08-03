@@ -11,6 +11,24 @@
 #include <sched.h>
 #endif
 
+/* Child functions do not call each other, a child requesting redirection to
+   another child returns it instead of calling it, to keep the stack flat.
+   The child which completed the request returns NULL. param is logged by
+   the child and released here.
+ */
+void * childfunc(struct clientparam * param){
+ PROXYFUNC pf = param->srv->pf;
+ int i;
+
+ for(i = 0; pf && i < MAXCHILDREDIRECTS; i++) pf = (PROXYFUNC)(*pf)(param);
+ if(pf){
+	param->res = 101;
+	dolog(param, (unsigned char *)"Redirection loop");
+ }
+ freeparam(param);
+ return NULL;
+}
+
 #define param ((struct clientparam *) p)
 #ifdef _WIN32
 DWORD WINAPI threadfunc(LPVOID p) {
@@ -121,7 +139,7 @@ void * threadfunc (void *p) {
 		}
 	    }
 	}
-	((struct clientparam *) p)->srv->pf((struct clientparam *)p);
+	childfunc((struct clientparam *)p);
  }
 #ifdef _WIN32
  return 0;
@@ -130,6 +148,20 @@ void * threadfunc (void *p) {
 #endif
 }
 #undef param
+
+#ifdef _WIN32
+/* Present since Windows 7 (SO_PORT_SCALABILITY) and Windows 10 / Server 2019
+   (SO_REUSE_UNICASTPORT), define them if the SDK is older so the options can
+   still be requested. setsockopt() just fails on a system which does not
+   support them and the failure is ignored.
+ */
+#ifndef SO_PORT_SCALABILITY
+#define SO_PORT_SCALABILITY 0x3006
+#endif
+#ifndef SO_REUSE_UNICASTPORT
+#define SO_REUSE_UNICASTPORT 0x3007
+#endif
+#endif
 
 struct socketoptions sockopts[] = {
 #ifdef TCP_NODELAY
@@ -147,14 +179,14 @@ struct socketoptions sockopts[] = {
 #ifdef TCP_TIMESTAMPS
 	{TCP_TIMESTAMPS, "TCP_TIMESTAMPS"},
 #endif
-#ifdef USE_TCP_FASTOPEN
-	{USE_TCP_FASTOPEN, "USE_TCP_FASTOPEN"},
-#endif
 #ifdef SO_REUSEADDR
 	{SO_REUSEADDR, "SO_REUSEADDR"},
 #endif
 #ifdef SO_REUSEPORT
 	{SO_REUSEPORT, "SO_REUSEPORT"},
+#endif
+#ifdef SO_EXCLUSIVEADDRUSE
+	{SO_EXCLUSIVEADDRUSE, "SO_EXCLUSIVEADDRUSE"},
 #endif
 #ifdef SO_PORT_SCALABILITY
 	{SO_PORT_SCALABILITY, "SO_PORT_SCALABILITY"},
@@ -279,6 +311,7 @@ int MODULEMAINFUNC (int argc, char** argv){
 #ifdef __linux__
  int saved_nsfd = -1;
 #endif
+#if !defined(PORTMAP) || !defined(NOPORTMAP)
  char loghelp[] =
 #ifdef STDMAIN
 #ifndef _WIN32
@@ -294,8 +327,8 @@ int MODULEMAINFUNC (int argc, char** argv){
 	" -Di(DEVICENAME) bind internal interface to device, e.g. eth1\n"
 	" -De(DEVICENAME) bind external interface to device, e.g. eth1\n"
 #endif
-#ifdef WITHSLICE
-	" -s Use slice() - faster proxing, but no filtering for data\n"
+#ifdef WITHSPLICE
+	" -s Use splice() - no filtering for data, off by default\n"
 #endif
 	"-g(GRACE_TRAFF,GRACE_NUM,GRACE_DELAY) - delay GRACE_DELAY milliseconds before polling if average polling size below  GRACE_TRAFF bytes and GRACE_NUM read operations in single directions are detected within 1 second to minimize polling\n"
 	" -fFORMAT logging format (see documentation)\n"
@@ -317,6 +350,7 @@ int MODULEMAINFUNC (int argc, char** argv){
 	" to-client (oc), to-server (os), listening (ol) socket, connect back client\n"
 	" (or) socket, connect back server (oR) listening socket\n"
 	" where possible options are: ";
+#endif
 
 #ifdef _WIN32
  unsigned long ul = 1;
@@ -367,6 +401,7 @@ int MODULEMAINFUNC (int argc, char** argv){
 	if(!srv.udpbuf || !srv.udpbuf2) {
 #ifndef STDMAIN
 		haveerror = 2;
+		_3proxy_sem_unlock(conf.threadinit);
 #endif
 		return 11;
 	}
@@ -528,6 +563,27 @@ int MODULEMAINFUNC (int argc, char** argv){
 			srv.needuser = 0;
 			if(*(argv[i] + 2)) srv.needuser = atoi(argv[i] + 2);
 			break;
+		 case 'x':
+			srv.nostarttls = 1;
+			break;
+		 case 'X':
+			if(!strncasecmp(argv[i]+2, "imap", 4)) srv.srvstarttls = S_IMAPP;
+			else if(!strncasecmp(argv[i]+2, "pop3", 4)) srv.srvstarttls = S_POP3P;
+			else if(!strncasecmp(argv[i]+2, "smtp", 4)) srv.srvstarttls = S_SMTPP;
+			else error = 1;
+			break;
+		 case 'F':
+			{
+				PROXYSOCKADDRTYPE fsa;
+				memset(&fsa, 0, sizeof(fsa));
+				if(!getip46(46, (unsigned char *)argv[i]+2, (struct sockaddr *)&fsa)) error = 1;
+				else if(*SAFAMILY(&fsa) == AF_INET) srv.fakeip = *(uint32_t *)SAADDR(&fsa);
+#ifndef NOIPV6
+				else if(*SAFAMILY(&fsa) == AF_INET6) memcpy(srv.fakeip6, SAADDR(&fsa), 16);
+#endif
+				else error = 1;
+			}
+			break;
 		 case 'T':
 			srv.transparent = 1;
 			break;
@@ -547,7 +603,7 @@ int MODULEMAINFUNC (int argc, char** argv){
 				srv.s_option = 1 + atoi(argv[i]+2);
 #ifdef WITHSPLICE
 			else
-				if(*(argv[i]+2)) srv.usesplice = atoi(argv[i]+2);
+				srv.usesplice = *(argv[i]+2)? atoi(argv[i]+2) : 1;
 #endif
 			break;
 		 case 'o':
@@ -587,7 +643,6 @@ int MODULEMAINFUNC (int argc, char** argv){
 	if (error || i!=argc) {
 #ifndef STDMAIN
 		haveerror = 1;
-		_3proxy_sem_unlock(conf.threadinit);
 #endif
 		fprintf(stderr, "%s of %s\n"
 			"Usage: %s options\n"
@@ -607,6 +662,9 @@ int MODULEMAINFUNC (int argc, char** argv){
 			""
 #endif
 		);
+#ifndef STDMAIN
+		_3proxy_sem_unlock(conf.threadinit);
+#endif
 
 		return (1);
 	}
@@ -619,7 +677,6 @@ int MODULEMAINFUNC (int argc, char** argv){
 	if (error || argc != i+3 || *argv[i]=='-'|| (*SAPORT(&srv.intsa) = htons((uint16_t)atoi(argv[i])))==0 || (srv.targetport = htons((uint16_t)atoi(argv[i+2])))==0) {
 #ifndef STDMAIN
 		haveerror = 1;
-		_3proxy_sem_unlock(conf.threadinit);
 #endif
 		fprintf(stderr, "%s of %s\n"
 			"Usage: %s options"
@@ -640,6 +697,9 @@ int MODULEMAINFUNC (int argc, char** argv){
 			""
 #endif
 		);
+#ifndef STDMAIN
+		_3proxy_sem_unlock(conf.threadinit);
+#endif
 		return (1);
 	}
 	srv.target = (unsigned char *)strdup(argv[i+1]);
@@ -663,7 +723,7 @@ int MODULEMAINFUNC (int argc, char** argv){
 		return 2;
 	};
 	*newparam = defparam;
-	return((*srv.pf)((void *)newparam)? 1:0);
+	return(childfunc(newparam)? 1:0);
 	
  }
 #endif
@@ -751,8 +811,15 @@ int MODULEMAINFUNC (int argc, char** argv){
 		if(*SAFAMILY(&srv.intsa) != AF_UNIX)
 #endif
 		{
+/* SO_REUSEADDR is not set on Windows: it is not needed to rebind a listening
+   port there, and it only allows another local process to bind the same
+   address and port, with undefined behaviour as to which socket receives the
+   connections. Use -olSO_EXCLUSIVEADDRUSE to prevent that instead.
+ */
+#ifndef _WIN32
 		opt = 1;
 		if(srv.so._setsockopt(srv.so.state, sock, SOL_SOCKET, SO_REUSEADDR, (char *)&opt, sizeof(int)))perror("setsockopt()");
+#endif
 #ifdef SO_REUSEPORT
 		opt = 1;
 		srv.so._setsockopt(srv.so.state, sock, SOL_SOCKET, SO_REUSEPORT, (char *)&opt, sizeof(int));
@@ -772,6 +839,9 @@ int MODULEMAINFUNC (int argc, char** argv){
 			return -12;
 		    }
 #ifndef NOIPV6
+#ifndef IPV6_BOUND_IF
+#define IPV6_BOUND_IF 125
+#endif
 	            if((*SAFAMILY(&srv.intsa) == AF_INET6 && srv.so._setsockopt(srv.so.state, sock, IPPROTO_IPV6, IPV6_BOUND_IF, &idx, sizeof(idx)))) {
 			dolog(&defparam, (unsigned char *)"failed to bind device");
 	        	return -12;
@@ -865,8 +935,10 @@ int MODULEMAINFUNC (int argc, char** argv){
 		freesrvstrings(&srv, cbc_string, cbl_string);
 		return -6;
 	}
+#ifndef _WIN32
 	opt = 1;
 	srv.so._setsockopt(srv.so.state, srv.cbsock, SOL_SOCKET, SO_REUSEADDR, (char *)&opt, sizeof(int));
+#endif
 #ifdef SO_REUSEPORT
 	opt = 1;
 	srv.so._setsockopt(srv.so.state, srv.cbsock, SOL_SOCKET, SO_REUSEPORT, (char *)&opt, sizeof(int));
@@ -893,7 +965,7 @@ int MODULEMAINFUNC (int argc, char** argv){
  
 #ifndef _WIN32
  pthread_attr_init(&pa);
- pthread_attr_setstacksize(&pa,PTHREAD_STACK_MIN + (32768 + srv.stacksize));
+ pthread_attr_setstacksize(&pa,threadstacksize(srv.stacksize));
  pthread_attr_setdetachstate(&pa,PTHREAD_CREATE_DETACHED);
 #endif
 
@@ -910,13 +982,7 @@ int MODULEMAINFUNC (int argc, char** argv){
 		}
 		if (iscbc) break;
 		if (conf.paused != srv.paused) break;
-		if (srv.fds.events & POLLIN) {
-			error = srv.so._poll(srv.so.state, &srv.fds, 1, 1000);
-		}
-		else {
-			usleep(SLEEPTIME);
-			continue;
-		}
+		error = srv.so._poll(srv.so.state, &srv.fds, 1, 1000);
 		if (error >= 1) break;
 		if (error == 0) continue;
 		if (errno != EAGAIN &&	errno != EINTR) {
@@ -1027,9 +1093,12 @@ int MODULEMAINFUNC (int argc, char** argv){
 	else {
 		struct clientparam *toparam;
 
-		srv.udplen = sockrecvfrom(NULL, srv.srvsock, (struct sockaddr *)&defparam.sincr, srv.udpbuf, UDPBUFSIZE, 0);
-		if(srv.udplen <= 0) continue;
 		_3proxy_sem_lock(udpinit);
+		srv.udplen = sockrecvfrom(NULL, srv.srvsock, (struct sockaddr *)&defparam.sincr, srv.udpbuf, UDPBUFSIZE, 0);
+		if(srv.udplen <= 0) {
+			_3proxy_sem_unlock(udpinit);
+			continue;
+		}
 		if(hashresolv(&udp_table, &defparam, &toparam, NULL)) {
 		    int i, len=0;
 		
@@ -1148,12 +1217,7 @@ int MODULEMAINFUNC (int argc, char** argv){
 
 #ifndef NOUDPMAIN
 int udpinited = 0;
-#ifdef _WIN32
-HANDLE udpinit;
-#else
-_3proxy_mutex_t udpinit;
-#endif
-
+_3proxy_sem_t udpinit;
 #endif
 
 void srvinit(struct srvparam * srv, struct clientparam *param){
@@ -1181,7 +1245,7 @@ void srvinit(struct srvparam * srv, struct clientparam *param){
  srv->saved_nsfd = srv->i_nsfd = srv->o_nsfd = -1;
 #endif
 #ifdef WITHSPLICE
- srv->usesplice = 1;
+ srv->usesplice = 0;
 #endif
  memset(param, 0, sizeof(struct clientparam));
  param->srv = srv;
@@ -1192,11 +1256,7 @@ void srvinit(struct srvparam * srv, struct clientparam *param){
  _3proxy_mutex_init(&srv->counter_mutex);
 #ifndef NOUDPMAIN
  if(!udpinited){
-#ifdef _WIN32
-    udpinit = CreateSemaphore(NULL, 1, 1, NULL);
-#else
-    _3proxy_mutex_init(&udpinit);
-#endif
+    (void)_3proxy_sem_init(udpinit, 1, 1);
  }
  udpinited = 1;
 #endif

@@ -134,12 +134,47 @@ int timeouts[12] = {
 	0
 };
 
-struct extparam conf = {
-#ifdef _WIN32
-	.threadinit = NULL,
-#else
-	.threadinit = 0,
+#ifndef _WIN32
+/* PTHREAD_STACK_MIN is 128K on glibc/aarch64 and glibc/powerpc and may be
+   a sysconf() call with _GNU_SOURCE. pthread_attr_setstacksize() fails with
+   EINVAL below it and the thread silently gets the 8M system default stack.
+ */
+size_t threadstacksize(int extra){
+	long size = BASESTACKSIZE + extra;
+
+	if(size < (long)PTHREAD_STACK_MIN) size = (long)PTHREAD_STACK_MIN;
+	return (size_t)size;
+}
+
+int _3proxy_sem_init_f(_3proxy_sem_t *sem, unsigned count, unsigned maxcount){
+	sem->count = count;
+	sem->maxcount = maxcount;
+	if(pthread_mutex_init(&sem->mutex, NULL)) return 1;
+	if(pthread_cond_init(&sem->cond, NULL)){
+		pthread_mutex_destroy(&sem->mutex);
+		return 1;
+	}
+	return 0;
+}
+
+void _3proxy_sem_lock_f(_3proxy_sem_t *sem){
+	pthread_mutex_lock(&sem->mutex);
+	while(!sem->count) pthread_cond_wait(&sem->cond, &sem->mutex);
+	sem->count--;
+	pthread_mutex_unlock(&sem->mutex);
+}
+
+void _3proxy_sem_unlock_f(_3proxy_sem_t *sem){
+	pthread_mutex_lock(&sem->mutex);
+	if(sem->count < sem->maxcount){
+		sem->count++;
+		pthread_cond_signal(&sem->cond);
+	}
+	pthread_mutex_unlock(&sem->mutex);
+}
 #endif
+
+struct extparam conf = {
 	.timeouts = timeouts,
 	.acl = NULL,
 	.conffile = NULL,
@@ -155,7 +190,7 @@ struct extparam conf = {
 	.paused = 0,
 	.archiverc = 0,
 	.demon = 0,
-	.maxchild = 500,
+	.maxchild = DEFAULT_MAXCHILD,
 	.backlog = 0,
 	.needreload = 0,
 	.timetoexit = 0,
@@ -499,6 +534,19 @@ int parsehostname(char *hostname, struct clientparam *param, uint16_t port){
 	if(se){
 		*se = 0;
 	}
+	if(!*hostname){
+		if(sp){
+			port = atoi(sp+1);
+			*sp = ':';
+		}
+		*SAPORT(&param->req) = htons(port);
+		return 0;
+	}
+	if(strlen(hostname + (se!=0)) > 253){
+		if(se) *se = ']';
+		if(sp) *sp = ':';
+		return 1;
+	}
 	if(hostname != (char *)param->hostname){
 		if(param->hostname) free(param->hostname);
 		param->hostname = (unsigned char *)strdup(hostname + (se!=0));
@@ -553,14 +601,14 @@ int parseconnusername(char *username, struct clientparam *param, int extpasswd, 
 	if(!username || !*username) return 1;
         if ((sb=strchr(username, conf.delimchar)) == NULL){
 		if(!param->hostname && param->remsock == INVALID_SOCKET) return 2;
-		if(param->hostname)parsehostname((char *)param->hostname, param, port);
+		if(param->hostname)parsehostname((char *)param->hostname, param, *SAPORT(&param->req)? ntohs(*SAPORT(&param->req)) : port);
 		return parseusername(username, param, extpasswd);
 	}
 	while ((se=strchr(sb+1, conf.delimchar)))sb=se;
 	*(sb) = 0;
 	if(parseusername(username, param, extpasswd)) return 3;
 	*(sb) = conf.delimchar;
-	if(parsehostname(sb+1, param, port)) return 4;
+	if(parsehostname(sb+1, param, *SAPORT(&param->req)? ntohs(*SAPORT(&param->req)) : port)) return 4;
 	return 0;
 }
 
@@ -633,20 +681,6 @@ int doconnect(struct clientparam * param){
 	setopts(param->remsock, param->srv->srvsockopts);
 
 	param->srv->so._setsockopt(param->sostate, param->remsock, SOL_SOCKET, SO_LINGER, (char *)&lg, sizeof(lg));
-#ifdef REUSE
-	{
-		int opt;
-
-#ifdef SO_REUSEADDR
-		opt = 1;
-		param->srv->so._setsockopt(param->sostate, param->remsock, SOL_SOCKET, SO_REUSEADDR, (char *)&opt, sizeof(int));
-#endif
-#ifdef SO_REUSEPORT
-		opt = 1;
-		param->srv->so._setsockopt(param->sostate, param->remsock, SOL_SOCKET, SO_REUSEPORT, (unsigned char *)&opt, sizeof(int));
-#endif
-	}
-#endif
 #if defined SO_BINDTODEVICE
 	if(param->srv->obindtodevice) {
 		if(param->srv->so._setsockopt(param->sostate, param->remsock, SOL_SOCKET, SO_BINDTODEVICE, param->srv->obindtodevice, strlen(param->srv->obindtodevice) + 1))
@@ -659,6 +693,9 @@ int doconnect(struct clientparam * param){
 	    if(!idx || (*SAFAMILY(&param->sinsl) == AF_INET && param->srv->so._setsockopt(param->sostate, param->remsock, IPPROTO_IP, IP_BOUND_IF, &idx, sizeof(idx))))
 			return 12;
 #ifndef NOIPV6
+#ifndef IPV6_BOUND_IF
+#define IPV6_BOUND_IF 125
+#endif
 	    if(*SAFAMILY(&param->sinsl) == AF_INET6 && param->srv->so._setsockopt(param->sostate, param->remsock, IPPROTO_IPV6, IPV6_BOUND_IF, &idx, sizeof(idx))) return 12;
 #endif
 	}
@@ -868,4 +905,22 @@ uint32_t getip46(int family, unsigned char *name,  struct sockaddr *sa){
 #endif
 	return 0;
 #endif
+}
+
+int hascap(const unsigned char *line, const char *cap){
+ int len = (int)strlen(cap);
+ for(; *line; line++) if(!strncasecmp((char *)line, cap, len)) return 1;
+ return 0;
+}
+
+int getmultiline(struct clientparam *param, DIRECTION which, unsigned char *buf, int bufsize, const char *cap, int *found){
+ int i;
+ do {
+	i = sockgetlinebuf(param, which, buf, bufsize, '\n', conf.timeouts[STRING_L]);
+	if(i > 0 && cap && found && !*found){
+		buf[i] = 0;
+		if(hascap(buf, cap)) *found = 1;
+	}
+ } while (i > 3 && buf[3] == '-');
+ return i;
 }

@@ -7,7 +7,7 @@
 */
 
 #include "proxy.h"
-#include "libs/blake2.h"
+#include "mdhash.h"
 
 void initbandlims(struct clientparam *param);
 
@@ -80,7 +80,7 @@ int cacheauth(struct clientparam * param){
 	((type & 4) && !param->password) ||
 	(
 	 (type & 1) && *SAFAMILY(&param->sincr) != AF_INET
-#ifndef NOIPv6
+#ifndef NOIPV6
 	    && *SAFAMILY(&param->sincr) != AF_INET6
 #endif
 	) || (!hashresolv(&auth_table, param, &ac, &ttl))) {
@@ -108,7 +108,6 @@ int cacheauth(struct clientparam * param){
 int doauth(struct clientparam * param){
 	int res = 0;
 	struct auth *authfuncs;
-	char * tmp;
 	int ret = 0;
 
 	for(authfuncs=param->srv->authfuncs; authfuncs; authfuncs=authfuncs->next){
@@ -125,7 +124,7 @@ int doauth(struct clientparam * param){
 				ac.username[63] = 0;
 			    }
 			    if(*SAFAMILY(&param->sincr) == AF_INET
-#ifndef NOIPv6
+#ifndef NOIPV6
 				 || *SAFAMILY(&param->sincr) == AF_INET6
 #endif
 			    ) {
@@ -134,7 +133,7 @@ int doauth(struct clientparam * param){
 			    }
 
 			    if(*SAFAMILY(&param->sinsl) == AF_INET
-#ifndef NOIPv6
+#ifndef NOIPV6
 				 || *SAFAMILY(&param->sinsl) == AF_INET6
 #endif
 			    ) {
@@ -216,8 +215,25 @@ int dnsauth(struct clientparam * param){
 	return param->username? 0:3;
 }
 
+static int ctmemcmp(const void *a, const void *b, size_t len){
+	const unsigned char *pa = (const unsigned char *)a, *pb = (const unsigned char *)b;
+	unsigned char diff = 0;
+	size_t i;
+	for(i = 0; i < len; i++) diff |= (unsigned char)(pa[i] ^ pb[i]);
+	return diff;
+}
+
+static int ctstrcmp(const char *a, const char *b, size_t maxlen){
+	unsigned char diff = 0;
+	size_t i;
+	for(i = 0; i < maxlen; i++){
+		diff |= (unsigned char)((unsigned char)a[i] ^ (unsigned char)b[i]);
+		if(!a[i] && !b[i]) break;
+	}
+	return diff;
+}
+
 int strongauth(struct clientparam * param){
-	static char dummy;
 	unsigned char buf[256];
 	char pass[256] = {0};
 
@@ -229,27 +245,33 @@ int strongauth(struct clientparam * param){
 			    int pwlen = strlen((char *)param->password);
 			    if(pwlen > 255) pwlen = 255;
 			    if((unsigned)pwlen < pwl_table.recsize) {
-				if(!strncmp(pass + 1, (char *)param->password, pwl_table.recsize - 1)) return 0;
+				memset(buf, 0, pwl_table.recsize - 1);
+				memcpy(buf, param->password, pwlen);
+				if(!ctmemcmp(pass + 1, buf, pwl_table.recsize - 1)) return 0;
 			    } else {
-				blake2b_state S;
+				mdh_ctx *bctx;
 				unsigned hashsz;
+				unsigned int blen;
 				hashsz = pwl_table.recsize - 1 < 64 ? pwl_table.recsize - 1 : 64;
 				memset(buf, 0, pwl_table.recsize - 1);
-				blake2b_init(&S, hashsz);
-				blake2b_update(&S, param->password, pwlen + 1);
-				blake2b_final(&S, buf, hashsz);
-				if(!memcmp(pass + 1, buf, pwl_table.recsize - 1)) return 0;
+				bctx = mdh_init(MDH_BLAKE2, hashsz);
+				if(!bctx) return 6;
+				mdh_update(bctx, param->password, pwlen + 1);
+				blen = hashsz;
+				mdh_final(bctx, buf, &blen);
+				mdh_free(bctx);
+				if(!ctmemcmp(pass + 1, buf, pwl_table.recsize - 1)) return 0;
 			    }
 			    return 6;
 			    }
 			    case CR:
 			    if (mycrypt(param->password, (unsigned char *)pass + 1, buf) &&
-			        !strcmp(pass + 1, (char *)buf))
+			        !ctstrcmp(pass + 1, (char *)buf, sizeof(pass) - 1))
 				return 0;
 			    else return 7;
 #ifdef WITH_SSL
 			    case NT:
-			    if(ntpwdhash(buf, param->password, 1) && !strcmp(pass + 1, (char *)buf)) return 0;
+			    if(ntpwdhash(buf, param->password, 1) && !ctstrcmp(pass + 1, (char *)buf, sizeof(pass) - 1)) return 0;
 			    else return 8;
 #endif
 			    default:

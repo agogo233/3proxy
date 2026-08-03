@@ -34,6 +34,7 @@
 #define MAXUSERNAME 128
 #define _PASSWORD_LEN 256
 #define MAXNSERVERS 5
+#define DEFAULT_MAXCHILD 500
 
 #define TCPBUFSIZE 65536
 #define SRVBUFSIZE (param->srv->bufsize?param->srv->bufsize:((param->service == S_UDPPM)?UDPBUFSIZE:TCPBUFSIZE))
@@ -103,13 +104,39 @@
 #include <pthread.h>
 #ifndef PTHREAD_STACK_MIN
 #define PTHREAD_STACK_MIN 32768
-#define sockerror strerror
 #endif
 void daemonize(void);
 #define SLEEPTIME 1000
 #ifndef O_BINARY
 #define O_BINARY 0
 #endif
+#endif
+
+/* Keeps a callee with a large frame out of the caller's frame, e.g. the
+   8K log buffer of logstdout() out of dolog(), which calls it in a branch
+   taken only when there is no service.
+ */
+#if defined(__GNUC__)
+#define NOINLINE __attribute__((noinline))
+#elif defined(_MSC_VER)
+#define NOINLINE __declspec(noinline)
+#else
+#define NOINLINE
+#endif
+
+/* Thread stack size, stacksize command value is added to it. BSD libc uses
+   significantly more stack, e.g. in vfprintf() called by syslog().
+ */
+#ifndef BASESTACKSIZE
+#if defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
+#define BASESTACKSIZE 65536
+#else
+#define BASESTACKSIZE 49152
+#endif
+#endif
+
+#ifndef _WIN32
+size_t threadstacksize(int extra);
 #endif
 
 #ifdef WITH_ODBC
@@ -188,6 +215,8 @@ unsigned long sockfillbuffcli(struct clientparam * param, unsigned long size, in
 unsigned long sockfillbuffsrv(struct clientparam * param, unsigned long size, int timeosec);
 
 int sockgetlinebuf(struct clientparam * param, DIRECTION which, unsigned char * buf, int bufsize, int delim, int to);
+int getmultiline(struct clientparam * param, DIRECTION which, unsigned char * buf, int bufsize, const char *cap, int *found);
+int hascap(const unsigned char *line, const char *cap);
 
 
 
@@ -196,7 +225,7 @@ void dolog(struct clientparam * param, const unsigned char *s);
 int dobuf(struct clientparam * param, unsigned char * buf, const unsigned char *s, const unsigned char * doublec);
 int dobuf2(struct clientparam * param, unsigned char * buf, const unsigned char *s, const unsigned char * doublec, struct tm* tm, char * format);
 extern FILE * stdlog;
-void logstdout(struct clientparam * param, const unsigned char *s);
+NOINLINE void logstdout(struct clientparam * param, const unsigned char *s);
 void logsyslog(struct clientparam * param, const unsigned char *s);
 void lognone(struct clientparam * param, const unsigned char *s);
 void logradius(struct clientparam * param, const unsigned char *s);
@@ -240,22 +269,24 @@ extern int paused;
 extern int demon;
 
 unsigned char * mycrypt(const unsigned char *key, const unsigned char *salt, unsigned char *buf);
-#ifdef WITH_SSL
 unsigned char * ntpwdhash (unsigned char *szHash, const unsigned char *szPassword, int tohex);
-#endif
 int de64 (const unsigned char *in, unsigned char *out, int maxlen);
 unsigned char* en64 (const unsigned char *in, unsigned char *out, int inlen);
 void tohex(unsigned char *in, unsigned char *out, int len);
 void fromhex(unsigned char *in, unsigned char *out, int len);
 
+extern _3proxy_sem_t udpinit;
 #ifdef _WIN32
-extern HANDLE udpinit;
+#define _3proxy_sem_init(x, count, maxcount) (((x) = CreateSemaphore(NULL, (count), (maxcount), NULL))? 0 : 1)
 #define _3proxy_sem_lock(x) WaitForSingleObject(x, INFINITE)
 #define _3proxy_sem_unlock(x) ReleaseSemaphore(x, 1, NULL)
 #else
-extern _3proxy_mutex_t udpinit;
-#define _3proxy_sem_lock(x) pthread_mutex_lock(&x)
-#define _3proxy_sem_unlock(x) pthread_mutex_unlock(&x)
+int _3proxy_sem_init_f(_3proxy_sem_t *sem, unsigned count, unsigned maxcount);
+void _3proxy_sem_lock_f(_3proxy_sem_t *sem);
+void _3proxy_sem_unlock_f(_3proxy_sem_t *sem);
+#define _3proxy_sem_init(x, count, maxcount) _3proxy_sem_init_f(&x, (count), (maxcount))
+#define _3proxy_sem_lock(x) _3proxy_sem_lock_f(&x)
+#define _3proxy_sem_unlock(x) _3proxy_sem_unlock_f(&x)
 #endif
 
 
@@ -314,6 +345,7 @@ void srvinit2(struct srvparam * srv, struct clientparam *param);
 void srvfree(struct srvparam * srv);
 unsigned char * dologname (unsigned char *buf, unsigned char *name, const unsigned char *ext, ROTATION lt, time_t t);
 int readconfig(FILE * fp);
+void initcommands(void);
 int connectwithpoll(struct clientparam *param, SOCKET sock, struct sockaddr *sa, SASIZETYPE size, int to);
 
 
@@ -327,6 +359,7 @@ extern char *copyright;
 
 void * dnsprchild(struct clientparam * param);
 void * pop3pchild(struct clientparam * param);
+void * imappchild(struct clientparam * param);
 void * smtppchild(struct clientparam * param);
 void * proxychild(struct clientparam * param);
 void * sockschild(struct clientparam * param);
@@ -336,6 +369,13 @@ void * udppmchild(struct clientparam * param);
 void * adminchild(struct clientparam * param);
 void * ftpprchild(struct clientparam * param);
 void * tlsprchild(struct clientparam * param);
+/* Child functions return the child to redirect the request to, or NULL if
+   the request is complete. childfunc() calls them and releases param.
+   Recursive redirection, e.g. a socks service redirected to socks5, used to
+   be limited by the stack size only, MAXCHILDREDIRECTS limits it now.
+ */
+#define MAXCHILDREDIRECTS 16
+void * childfunc(struct clientparam * param);
 
 
 struct datatype;

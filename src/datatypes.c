@@ -61,13 +61,6 @@ static void pr_ip(struct node *node, CBFUNC cbf, void*cb){
 	if(node->value)(*cbf)(cb, buf, myinet_ntop(AF_INET, node -> value, buf, 4));
 }
 
-#ifndef NOIPV6
-static void pr_ip6(struct node *node, CBFUNC cbf, void*cb){
-	char buf[64];
-	if(node->value)(*cbf)(cb, buf, myinet_ntop(AF_INET6, node -> value, buf, 16));
-}
-#endif
-
 static void pr_sa(struct node *node, CBFUNC cbf, void*cb){
 #ifdef NOIPV6
 	if(node->value)pr_ip(node, cbf, cb);
@@ -523,7 +516,7 @@ static void * ef_server_next(struct node * node){
 
 static void * ef_server_type(struct node * node){
 	int service = ((struct srvparam *)node->value) -> service;
-	return (service>=0 && service < 15)? (void *)conf.stringtable[SERVICES + service] : (void *)"unknown";
+	return (service>=0 && service < MAX_SERVICE)? (void *)conf.stringtable[SERVICES + service] : (void *)"unknown";
 }
 
 static void * ef_server_child(struct node * node){
@@ -682,7 +675,7 @@ static void * ef_client_next(struct node * node){
 
 static void * ef_client_type(struct node * node){
 	int service = ((struct clientparam *)node->value) -> service;
-	return (service>=0 && service < 15)? (void *)conf.stringtable[SERVICES + service] : (void *)"unknown";
+	return (service>=0 && service < MAX_SERVICE)? (void *)conf.stringtable[SERVICES + service] : (void *)"unknown";
 }
 
 static void * ef_client_operation(struct node * node){

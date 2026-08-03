@@ -6,11 +6,20 @@
 */
 
 #include "structures.h"
+#ifdef WITH_WOLFSSL
+#include <wolfssl/options.h>
+#include <wolfssl/openssl/crypto.h>
+#include <wolfssl/openssl/x509.h>
+#include <wolfssl/openssl/pem.h>
+#include <wolfssl/openssl/ssl.h>
+#include <wolfssl/openssl/err.h>
+#else
 #include <openssl/crypto.h>
 #include <openssl/x509.h>
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#endif
 #include "proxy.h"
 #include "ssl.h"
 
@@ -44,7 +53,6 @@ static char *client_ca_store = NULL;
 static int mitm = 0;
 static int serv = 0;
 static int cli = 0;
-static int ssl_inited = 0;
 static int client_min_proto_version = 0;
 static int client_max_proto_version = 0;
 static int server_min_proto_version = 0;
@@ -477,9 +485,23 @@ EVP_PKEY * getKey(const char *fname){
     return key;
 }
 
-static int verify_callback(int preverify_ok, X509_STORE_CTX *ctx){
-    return preverify_ok;
+#ifdef WITH_WOLFSSL
+/* wolfSSL's SSL_CTX_use_PrivateKey(EVP_PKEY*) compat is unreliable: it
+ * silently fails (returns 0, no error queued) for keys loaded via
+ * PEM_read_bio_PrivateKey. Export the key to DER and load via the
+ * native buffer API instead. */
+static int ssl_ctx_use_pkey(SSL_CTX *ctx, EVP_PKEY *key){
+    unsigned char *der = NULL;
+    int len, rc;
+    len = i2d_PrivateKey(key, &der);
+    if(len <= 0 || !der) return 0;
+    rc = wolfSSL_CTX_use_PrivateKey_buffer(ctx, der, (long)len, SSL_FILETYPE_ASN1);
+    OPENSSL_free(der);
+    return rc;
 }
+#else
+#define ssl_ctx_use_pkey(ctx, key) SSL_CTX_use_PrivateKey((ctx), (key))
+#endif
 
 
 SSL_CTX * ssl_cli_ctx(SSL_CONFIG *config, X509 *server_cert, EVP_PKEY *server_key, char** errSSL){
@@ -487,7 +509,7 @@ SSL_CTX * ssl_cli_ctx(SSL_CONFIG *config, X509 *server_cert, EVP_PKEY *server_ke
     int err = 0;
 
 
-#if OPENSSL_VERSION_NUMBER < 0x10100000L
+#if !defined(WITH_WOLFSSL) && OPENSSL_VERSION_NUMBER < 0x10100000L
     ctx = SSL_CTX_new(SSLv23_server_method());
 #else
     ctx = SSL_CTX_new(TLS_server_method());
@@ -507,24 +529,34 @@ SSL_CTX * ssl_cli_ctx(SSL_CONFIG *config, X509 *server_cert, EVP_PKEY *server_ke
 	}
     }
 
-    err = SSL_CTX_use_PrivateKey(ctx, server_key);
-    if ( err <= 0 ) {
-	*errSSL = getSSLErr();
-	SSL_CTX_free(ctx);
-	return NULL;
+    /* Load the private key only when a cert is already loaded into ctx.
+     * wolfSSL validates the key against the cert and requires the cert
+     * to be present first; OpenSSL tolerates either order but is happy
+     * with cert-first too. When server_cert is NULL (serv path), the
+     * caller loads the cert chain and the key itself after this call. */
+    if(server_cert) {
+	err = ssl_ctx_use_pkey(ctx, server_key);
+	if ( err <= 0 ) {
+	    *errSSL = getSSLErr();
+	    SSL_CTX_free(ctx);
+	    return NULL;
+	}
     }
     SSL_CTX_set_session_id_context(ctx, (const unsigned char *)"3proxy", 6);
     if(config->server_min_proto_version)SSL_CTX_set_min_proto_version(ctx, config->server_min_proto_version);
     if(config->server_max_proto_version)SSL_CTX_set_max_proto_version(ctx, config->server_max_proto_version);
     if(config->server_cipher_list)SSL_CTX_set_cipher_list(ctx, config->server_cipher_list);
-#if OPENSSL_VERSION_NUMBER >= 0x10101000L
+#if !defined(WITH_WOLFSSL) && OPENSSL_VERSION_NUMBER >= 0x10101000L
     if(config->server_ciphersuites)SSL_CTX_set_ciphersuites(ctx, config->server_ciphersuites);
+#elif defined(WITH_WOLFSSL)
+    /* wolfSSL has no separate TLS1.3 ciphersuites API; route to cipher list. */
+    if(config->server_ciphersuites)wolfSSL_CTX_set_cipher_list(ctx, config->server_ciphersuites);
 #endif
     if(config->server_verify){
                 if(config->server_ca_file || config->server_ca_dir){
                     SSL_CTX_load_verify_locations(ctx, config->server_ca_file, config->server_ca_dir);
                 }
-#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+#if !defined(WITH_WOLFSSL) && OPENSSL_VERSION_NUMBER >= 0x30000000L
                 else if(config->server_ca_store){
                     SSL_CTX_load_verify_store(ctx, config->server_ca_store);
                 }
@@ -643,6 +675,10 @@ static void* ssl_filter_open(void * idata, struct srvparam * srv){
 		fprintf(stderr, "failed to read server cert: %s\n", srvcert);
 		return sc;
 	    }
+	    if(ssl_ctx_use_pkey(sc->cli_ctx, sc->server_key) <= 0){
+		fprintf(stderr, "failed to use server key\n");
+		return sc;
+	    }
 	    sc->serv = 1;
 	}
 	if(mitm || cli || serv){
@@ -655,7 +691,7 @@ static void* ssl_filter_open(void * idata, struct srvparam * srv){
 	    srv->so._poll = ssl_poll;
 	}
 	if(sc && (sc->mitm || sc->cli)){
-#if OPENSSL_VERSION_NUMBER < 0x10100000L
+#if !defined(WITH_WOLFSSL) && OPENSSL_VERSION_NUMBER < 0x10100000L
 	    sc->srv_ctx = SSL_CTX_new(SSLv23_client_method());
 #else
 	    sc->srv_ctx = SSL_CTX_new(TLS_client_method());
@@ -666,30 +702,42 @@ static void* ssl_filter_open(void * idata, struct srvparam * srv){
 	    }
 	    if(sc->client_cert){
 		SSL_CTX_use_certificate(sc->srv_ctx, (X509 *) sc->client_cert);
-		SSL_CTX_use_PrivateKey(sc->srv_ctx, sc->client_key);
+		ssl_ctx_use_pkey(sc->srv_ctx, sc->client_key);
 	    }
 	    if(sc->client_min_proto_version)SSL_CTX_set_min_proto_version(sc->srv_ctx, sc->client_min_proto_version);
 	    if(sc->client_max_proto_version)SSL_CTX_set_max_proto_version(sc->srv_ctx, sc->client_max_proto_version);
 	    if(sc->client_cipher_list)SSL_CTX_set_cipher_list(sc->srv_ctx, sc->client_cipher_list);
-#if OPENSSL_VERSION_NUMBER >= 0x10101000L
+#if !defined(WITH_WOLFSSL) && OPENSSL_VERSION_NUMBER >= 0x10101000L
 	    if(sc->client_ciphersuites)SSL_CTX_set_ciphersuites(sc->srv_ctx, sc->client_ciphersuites);
+#elif defined(WITH_WOLFSSL)
+	    /* wolfSSL has no separate TLS1.3 ciphersuites API; route to cipher list. */
+	    if(sc->client_ciphersuites)wolfSSL_CTX_set_cipher_list(sc->srv_ctx, sc->client_ciphersuites);
 #endif
-#if OPENSSL_VERSION_NUMBER >= 0x10200000L
+#if (defined(WITH_WOLFSSL) && defined(HAVE_ALPN) && LIBWOLFSSL_VERSION_HEX >= 0x03007000) || (!defined(WITH_WOLFSSL) && OPENSSL_VERSION_NUMBER >= 0x10200000L)
 	    if(sc->client_alpn_protos.protos_len)SSL_CTX_set_alpn_protos(sc->srv_ctx, sc->client_alpn_protos.protos, sc->client_alpn_protos.protos_len);
 #endif
 	    if(sc->client_verify){
 		if(sc->client_ca_file || sc->client_ca_dir){
 		    SSL_CTX_load_verify_locations(sc->srv_ctx, sc->client_ca_file, sc->client_ca_dir);
 		}
-#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+#if !defined(WITH_WOLFSSL) && OPENSSL_VERSION_NUMBER >= 0x30000000L
 		else if(sc->client_ca_store){
 		    SSL_CTX_load_verify_store(sc->srv_ctx, sc->client_ca_store);
 		}
 #endif
 		else
 		    SSL_CTX_set_default_verify_paths(sc->srv_ctx);
-		    SSL_CTX_set_verify(sc->srv_ctx, SSL_VERIFY_PEER|SSL_VERIFY_FAIL_IF_NO_PEER_CERT, NULL);
+		SSL_CTX_set_verify(sc->srv_ctx, SSL_VERIFY_PEER|SSL_VERIFY_FAIL_IF_NO_PEER_CERT, NULL);
 	    }
+#ifdef WITH_WOLFSSL
+	    else {
+		/* wolfSSL defaults to peer verification; OpenSSL defaults to
+		 * SSL_VERIFY_NONE. Make the no-verify intent explicit so the
+		 * upstream handshake (ssl_cli / ssl_mitm) succeeds without a
+		 * trusted CA store. */
+		SSL_CTX_set_verify(sc->srv_ctx, SSL_VERIFY_NONE, NULL);
+	    }
+#endif
 	}
 #ifdef WITHSPLICE
 	srv->usesplice = 0;
@@ -865,7 +913,7 @@ static void unsetfilters(){
 	}
 }
 
-static int h_mitm(int argc, unsigned char **argv){
+int h_mitm(int argc, unsigned char **argv){
 	if(mitm) return 0;
 	if(serv) return 2;
 	mitm = 1;
@@ -873,14 +921,14 @@ static int h_mitm(int argc, unsigned char **argv){
 	return 0;
 }
 
-static int h_nomitm(int argc, unsigned char **argv){
+int h_nomitm(int argc, unsigned char **argv){
 	if(!mitm) return 0;
 	mitm = 0;
 	unsetfilters();
 	return 0;
 }
 
-static int h_serv(int argc, unsigned char **argv){
+int h_serv(int argc, unsigned char **argv){
 	if(serv) return 0;
 	if(mitm) return 2;
 	serv = 1;
@@ -888,14 +936,14 @@ static int h_serv(int argc, unsigned char **argv){
 	return 0;
 }
 
-static int h_noserv(int argc, unsigned char **argv){
+int h_noserv(int argc, unsigned char **argv){
 	if(!serv) return 0;
 	serv = 0;
 	unsetfilters();
 	return 0;
 }
 
-static int h_cli(int argc, unsigned char **argv){
+int h_cli(int argc, unsigned char **argv){
 	if(cli) return 0;
 	if(mitm) return 2;
 	cli = 1;
@@ -903,7 +951,7 @@ static int h_cli(int argc, unsigned char **argv){
 	return 0;
 }
 
-static int h_nocli(int argc, unsigned char **argv){
+int h_nocli(int argc, unsigned char **argv){
 	if(!cli) return 0;
 	cli = 0;
 	unsetfilters();
@@ -911,7 +959,7 @@ static int h_nocli(int argc, unsigned char **argv){
 }
 
 
-static int h_certcache(int argc, unsigned char **argv){
+int h_certcache(int argc, unsigned char **argv){
 	size_t len;
 	len = strlen((char *)argv[1]);
 	if(!len || (argv[1][len - 1] != '/' && argv[1][len - 1] != '\\')) return 1;
@@ -920,92 +968,92 @@ static int h_certcache(int argc, unsigned char **argv){
 	return 0;
 }
 
-static int h_srvcert(int argc, unsigned char **argv){
+int h_srvcert(int argc, unsigned char **argv){
 	free(srvcert);
 	srvcert = argc > 1? strdup((char *)argv[1]) : NULL;
 	return 0;
 }
 
-static int h_srvkey(int argc, unsigned char **argv){
+int h_srvkey(int argc, unsigned char **argv){
 	free(srvkey);
 	srvkey = argc > 1? strdup((char *)argv[1]) : NULL;
 	return 0;
 }
 
-static int h_clicert(int argc, unsigned char **argv){
+int h_clicert(int argc, unsigned char **argv){
 	free(clicert);
 	clicert = argc > 1? strdup((char *)argv[1]) : NULL;
 	return 0;
 }
 
-static int h_clikey(int argc, unsigned char **argv){
+int h_clikey(int argc, unsigned char **argv){
 	free(clikey);
 	clikey = argc > 1? strdup((char *)argv[1]) : NULL;
 	return 0;
 }
 
 
-static int h_client_cipher_list(int argc, unsigned char **argv){
+int h_client_cipher_list(int argc, unsigned char **argv){
 	free(client_cipher_list);
 	client_cipher_list = argc > 1? strdup((char *)argv[1]) : NULL;
 	return 0;
 }
 
-static int h_server_cipher_list(int argc, unsigned char **argv){
+int h_server_cipher_list(int argc, unsigned char **argv){
 	free(server_cipher_list);
 	server_cipher_list = argc > 1? strdup((char *)argv[1]) : NULL;
 	return 0;
 }
 
-static int h_client_ciphersuites(int argc, unsigned char **argv){
+int h_client_ciphersuites(int argc, unsigned char **argv){
 	free(client_ciphersuites);
 	client_ciphersuites = argc > 1? strdup((char *)argv[1]) : NULL;
 	return 0;
 }
 
-static int h_server_ciphersuites(int argc, unsigned char **argv){
+int h_server_ciphersuites(int argc, unsigned char **argv){
 	free(server_ciphersuites);
 	server_ciphersuites = argc > 1? strdup((char *)argv[1]) : NULL;
 	return 0;
 }
 
-static int h_server_ca_file(int argc, unsigned char **argv){
+int h_server_ca_file(int argc, unsigned char **argv){
 	free(server_ca_file);
 	server_ca_file = argc > 1? strdup((char *)argv[1]) : NULL;
 	return 0;
 }
 
-static int h_server_ca_key(int argc, unsigned char **argv){
+int h_server_ca_key(int argc, unsigned char **argv){
 	free(server_ca_key);
 	server_ca_key = argc > 1? strdup((char *)argv[1]) : NULL;
 	return 0;
 }
 
-static int h_client_ca_file(int argc, unsigned char **argv){
+int h_client_ca_file(int argc, unsigned char **argv){
 	free(client_ca_file);
 	client_ca_file = argc > 1? strdup((char *)argv[1]) : NULL;
 	return 0;
 }
 
-static int h_client_ca_dir(int argc, unsigned char **argv){
+int h_client_ca_dir(int argc, unsigned char **argv){
 	free(client_ca_dir);
 	client_ca_dir = argc > 1? strdup((char *)argv[1]) : NULL;
 	return 0;
 }
 
-static int h_client_ca_store(int argc, unsigned char **argv){
+int h_client_ca_store(int argc, unsigned char **argv){
 	free(client_ca_store);
 	client_ca_store = argc > 1? strdup((char *)argv[1]) : NULL;
 	return 0;
 }
 
-static int h_client_sni(int argc, unsigned char **argv){
+int h_client_sni(int argc, unsigned char **argv){
 	free(client_sni);
 	client_sni = argc > 1? strdup((char *)argv[1]) : NULL;
 	return 0;
 }
 
-static int h_client_alpn(int argc, unsigned char **argv){
+int h_client_alpn(int argc, unsigned char **argv){
     int len, i;
 
     if(client_alpn_protos.protos_len){
@@ -1035,13 +1083,13 @@ static int h_client_alpn(int argc, unsigned char **argv){
     return 0;
 }
 
-static int h_server_ca_dir(int argc, unsigned char **argv){
+int h_server_ca_dir(int argc, unsigned char **argv){
 	free(server_ca_dir);
 	server_ca_dir = argc > 1? strdup((char *)argv[1]) : NULL;
 	return 0;
 }
 
-static int h_server_ca_store(int argc, unsigned char **argv){
+int h_server_ca_store(int argc, unsigned char **argv){
 	free(server_ca_store);
 	server_ca_store = argc > 1? strdup((char *)argv[1]) : NULL;
 	return 0;
@@ -1082,41 +1130,41 @@ int string_to_version(unsigned char *ver){
     return 0;
 }
 
-static int h_client_min_proto_version(int argc, unsigned char **argv){
+int h_client_min_proto_version(int argc, unsigned char **argv){
 	client_min_proto_version = argc>1? string_to_version(argv[1]) : 0;
 	return 0;
 }
 
-static int h_client_max_proto_version(int argc, unsigned char **argv){
+int h_client_max_proto_version(int argc, unsigned char **argv){
 	client_max_proto_version = argc>1? string_to_version(argv[1]) : 0;
 	return 0;
 }
 
-static int h_server_min_proto_version(int argc, unsigned char **argv){
+int h_server_min_proto_version(int argc, unsigned char **argv){
 	server_min_proto_version = argc>1? string_to_version(argv[1]) : 0;
 	return 0;
 }
 
-static int h_server_max_proto_version(int argc, unsigned char **argv){
+int h_server_max_proto_version(int argc, unsigned char **argv){
 	server_max_proto_version = argc>1? string_to_version(argv[1]) : 0;
 	return 0;
 }
 
-static int h_client_verify(int argc, unsigned char **argv){
+int h_client_verify(int argc, unsigned char **argv){
 	client_verify = 1;
 	return 0;
 }
-static int h_no_client_verify(int argc, unsigned char **argv){
+int h_no_client_verify(int argc, unsigned char **argv){
 	client_verify = 0;
 	return 0;
 }
 
-static int h_server_verify(int argc, unsigned char **argv){
+int h_server_verify(int argc, unsigned char **argv){
 	server_verify = 1;
 	return 0;
 }
 
-static int h_client_mode(int argc, unsigned char **argv){
+int h_client_mode(int argc, unsigned char **argv){
 	client_mode = 0;
 	if(argc <= 1) return 0;
 	client_mode = atoi((char *)argv[1]);
@@ -1124,50 +1172,10 @@ static int h_client_mode(int argc, unsigned char **argv){
 }
 
 
-static int h_no_server_verify(int argc, unsigned char **argv){
+int h_no_server_verify(int argc, unsigned char **argv){
 	server_verify = 0;
 	return 0;
 }
-
-static struct commands ssl_commandhandlers[] = {
-	{ssl_commandhandlers+1, "ssl_mitm", h_mitm, 1, 1},
-	{ssl_commandhandlers+2, "ssl_nomitm", h_nomitm, 1, 1},
-	{ssl_commandhandlers+3, "ssl_serv", h_serv, 1, 1},
-	{ssl_commandhandlers+4, "ssl_noserv", h_noserv, 1, 1},
-	{ssl_commandhandlers+5, "ssl_server_cert", h_srvcert, 1, 2},
-	{ssl_commandhandlers+6, "ssl_server_key", h_srvkey, 1, 2},
-	{ssl_commandhandlers+7, "ssl_server_ca_file", h_server_ca_file, 1, 2},
-	{ssl_commandhandlers+8, "ssl_server_ca_key", h_server_ca_key, 1, 2},
-	{ssl_commandhandlers+9, "ssl_client_ca_file", h_client_ca_file, 1, 2},
-	{ssl_commandhandlers+10, "ssl_client_ca_dir", h_client_ca_dir, 1, 2},
-	{ssl_commandhandlers+11, "ssl_client_ca_store", h_client_ca_store, 1, 2},
-	{ssl_commandhandlers+12, "ssl_client_ciphersuites", h_client_ciphersuites, 1, 2},
-	{ssl_commandhandlers+13, "ssl_server_ciphersuites", h_server_ciphersuites, 1, 2},
-	{ssl_commandhandlers+14, "ssl_client_cipher_list", h_client_cipher_list, 1, 2},
-	{ssl_commandhandlers+15, "ssl_server_cipher_list", h_server_cipher_list, 1, 2},
-	{ssl_commandhandlers+16, "ssl_client_min_proto_version", h_client_min_proto_version, 1, 2},
-	{ssl_commandhandlers+17, "ssl_server_min_proto_version", h_server_min_proto_version, 1, 2},
-	{ssl_commandhandlers+18, "ssl_client_max_proto_version", h_client_max_proto_version, 1, 2},
-	{ssl_commandhandlers+19, "ssl_server_max_proto_version", h_server_max_proto_version, 1, 2},
-	{ssl_commandhandlers+20, "ssl_client_verify", h_client_verify, 1, 1},
-	{ssl_commandhandlers+21, "ssl_client_no_verify", h_no_client_verify, 1, 1},
-	{ssl_commandhandlers+22, "ssl_cli", h_cli, 1, 1},
-	{ssl_commandhandlers+23, "ssl_nocli", h_nocli, 1, 1},
-	{ssl_commandhandlers+24, "ssl_client_cert", h_clicert, 1, 2},
-	{ssl_commandhandlers+25, "ssl_client_key", h_clikey, 1, 2},
-	{ssl_commandhandlers+26, "ssl_server", h_serv, 1, 1},
-	{ssl_commandhandlers+27, "ssl_noserver", h_noserv, 1, 1},
-	{ssl_commandhandlers+28, "ssl_client", h_cli, 1, 1},
-	{ssl_commandhandlers+29, "ssl_noclient", h_nocli, 1, 1},
-	{ssl_commandhandlers+30, "ssl_server_verify", h_server_verify, 1, 1},
-	{ssl_commandhandlers+31, "ssl_server_no_verify", h_no_server_verify, 1, 1},
-	{ssl_commandhandlers+32, "ssl_server_ca_dir", h_server_ca_dir, 1, 2},
-	{ssl_commandhandlers+33, "ssl_server_ca_store", h_server_ca_store, 1, 2},
-	{ssl_commandhandlers+34, "ssl_client_sni", h_client_sni, 1, 2},
-	{ssl_commandhandlers+35, "ssl_client_alpn", h_client_alpn, 1, 0},
-	{ssl_commandhandlers+36, "ssl_client_mode", h_client_mode, 1, 2},
-	{NULL, "ssl_certcache", h_certcache, 2, 2},
-};
 
 static struct symbol ssl_symbols[] = {
         {NULL, "ssl_parent", (void *)&ssl_parent},
@@ -1226,8 +1234,6 @@ void ssl_install(void){
 	if(!ssl_loaded){
 		ssl_loaded = 1;
 		ssl_init();
-		ssl_commandhandlers[(sizeof(ssl_commandhandlers)/sizeof(struct commands))-1].next = pl->commandhandlers->next;
-		pl->commandhandlers->next = ssl_commandhandlers;
 		ssl_symbols[0].next = pl->symbols.next;
 		pl->symbols.next = ssl_symbols;
 	}

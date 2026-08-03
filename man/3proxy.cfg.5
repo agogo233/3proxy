@@ -55,6 +55,9 @@ Recursion is not allowed.
 .B pop3p
 [options]
 .br
+.B imapp
+[options]
+.br
 .B smtpp
 [options]
 .br
@@ -91,6 +94,9 @@ Proxy with protocol autoselection between proxy / socks / tlspr
 .br
 .B pop3p
 POP3 proxy (default port 110)
+.br
+.B imapp
+IMAPv4 proxy (default port 143)
 .br
 .B smtpp
 SMTP proxy (default port 25)
@@ -172,7 +178,8 @@ connect to given remote HOST:port instead of listening local connection on -p or
 .br
 .B -oc\fIOPTIONS\fB, -os\fIOPTIONS\fB, -ol\fIOPTIONS\fB, -or\fIOPTIONS\fB, -oR\fIOPTIONS\fR
 options for proxy-to-client (\fB-oc\fR), proxy-to-server (\fB-os\fR), proxy listening (\fB-ol\fR), connect back client (\fB-or\fR), connect back listening (\fB-oR\fR) sockets.
-Options like TCP_CORK, TCP_NODELAY, TCP_DEFER_ACCEPT, TCP_QUICKACK, TCP_TIMESTAMPS, USE_TCP_FASTOPEN, SO_REUSEADDR, SO_REUSEPORT, SO_PORT_SCALABILITY, SO_REUSE_UNICASTPORT, SO_KEEPALIVE, SO_DONTROUTE may be supported depending on OS.
+Options like TCP_CORK, TCP_NODELAY, TCP_DEFER_ACCEPT, TCP_QUICKACK, TCP_TIMESTAMPS, TCP_FASTOPEN, SO_REUSEADDR, SO_REUSEPORT, SO_EXCLUSIVEADDRUSE, SO_PORT_SCALABILITY, SO_REUSE_UNICASTPORT, SO_KEEPALIVE, SO_DONTROUTE may be supported depending on OS.
+SO_REUSEADDR and SO_REUSEPORT are set on the listening socket by default on Unix. On Windows SO_REUSEADDR is not set: it is not required to rebind a listening port and it only lets another local process bind the same address and port. Use SO_EXCLUSIVEADDRUSE (Windows) on the listening socket (\fB-ol\fR) to prevent that.
 .br
 .B -H
 (for all services) Expect HAProxy PROXY protocol v1 header on incoming connection.
@@ -182,9 +189,16 @@ any protocol-specific data.
 .br
 .B -g(\fIGRACE_TRAFF\fB,\fIGRACE_NUM\fB,\fIGRACE_DELAY\fR)
 delay GRACE_DELAY milliseconds before polling if average polling size is below GRACE_TRAFF bytes and GRACE_NUM read operations in a single direction are detected within 1 second. Useful to minimize polling
+.br
 .B -s
  (for admin) secure, allow only secure operations, currently only traffic counters
 view without ability to reset.
+.br
+ (for TCP services, Linux) enable splice(). splice() is not built by default and
+is disabled even when built, because current Linux does not implement
+SPLICE_F_MOVE, so no real zero-copy takes place and the read/write path is faster
+for most traffic. Rebuild with -DWITHSPLICE to make -s available, -s0 disables it
+explicitly.
 .br
  (for dnspr) simple, do not use resolver and 3proxy cache, always use external DNS server.
 .br
@@ -209,6 +223,7 @@ Never ask for username/password
 .BR proxy (8)
 .BR socks (8)
 .BR pop3p (8)
+.BR imapp (8)
 .BR tcppm (8)
 .BR udppm (8)
 .BR ftppr (8)
@@ -821,9 +836,16 @@ unless you know exactly you need it.
 .br
  \fBadmin\fR redirect request to local \'admin\' service (with -s parameter).
 .br
-\fBha\fR send HAProxy PROXY protocol v1 header to parent proxy. Must be the last
-in the proxy chain. Useful for passing client IP information to the parent proxy.
-Example: parent 1000 ha
+\fBha\fR send HAProxy PROXY protocol v1 header to the next parent proxy (or to
+the destination if \fBha\fR is used alone). Place \fBha\fR before the parent
+that should receive the header; after the header is sent, negotiation of that
+parent protocol continues (SOCKS, CONNECT, etc.). Useful for passing client IP
+information to the parent proxy.
+Example:
+.br
+ parent 1000 ha 0.0.0.0 0
+.br
+ parent 1000 socks5 parent.example.com 1080
 .br
 Use "+" proxy only with \fBfakeresolve\fR option
 .br
@@ -847,6 +869,9 @@ locally redirects to
 .B pop3
 locally redirects to
 .B pop3p
+.B imap
+locally redirects to
+.B imapp
 .B http
 locally redirects to
 .B proxy
@@ -1161,6 +1186,19 @@ crash on request processing, try to set some positive value. You may start with
 stacksize 65536
 and then find the minimal value for the service to work. If you experience
 memory shortage, you can try to experiment with negative values.
+.br
+ With SQL logging (log &ODBC_string) the value is automatically raised to
+32768 if it is smaller, because ODBC drivers require more stack. A
+.BR stacksize
+command placed after the
+.BR log
+command overrides this.
+.br
+ The base stack size the value is added to is 49152. On FreeBSD, NetBSD,
+OpenBSD and DragonFly it is 65536, because libc functions such as vfprintf()
+called by syslog() use significantly more stack there. The result is never
+lowered below PTHREAD_STACK_MIN, so a large negative value can not disable
+the thread stack.
 
 .SH PLUGINS
 
@@ -1384,7 +1422,7 @@ authentication and/or allow/deny ACLs.
 Report all bugs to
 .BR 3proxy@3proxy.org
 .SH SEE ALSO
-3proxy(8), 3proxy_crypt(8), proxy(8), ftppr(8), socks(8), pop3p(8), smtpp(8), tlspr(8), tcppm(8), udppm(8), syslogd(8),
+3proxy(8), 3proxy_crypt(8), proxy(8), ftppr(8), socks(8), pop3p(8), imapp(8), smtpp(8), tlspr(8), tcppm(8), udppm(8), syslogd(8),
 .br
  https://3proxy.org/
 .SH AUTHORS

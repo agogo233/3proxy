@@ -87,6 +87,7 @@ start gateway services:</p>
 [options] <b><br>
 socks</b> [options] <b><br>
 pop3p</b> [options] <b><br>
+imapp</b> [options] <b><br>
 smtpp</b> [options] <b><br>
 ftppr</b> [options] <b><br>
 admin</b> [options] <b><br>
@@ -104,6 +105,7 @@ handshake), may be used to redirect any TLS-based traffic
 auto</b> Proxy with protocol autoselection between proxy /
 socks / tlspr <b><br>
 pop3p</b> POP3 proxy (default port 110) <b><br>
+imapp</b> IMAPv4 proxy (default port 143) <b><br>
 smtpp</b> SMTP proxy (default port 25) <b><br>
 ftppr</b> FTP proxy (default port 21) <b><br>
 admin</b> Web interface (default port 80) <b><br>
@@ -190,9 +192,16 @@ or hostname, useful in case of dynamic DNS. <b><br>
 (<b>-ol</b>), connect back client (<b>-or</b>), connect back
 listening (<b>-oR</b>) sockets. Options like TCP_CORK,
 TCP_NODELAY, TCP_DEFER_ACCEPT, TCP_QUICKACK, TCP_TIMESTAMPS,
-USE_TCP_FASTOPEN, SO_REUSEADDR, SO_REUSEPORT,
-SO_PORT_SCALABILITY, SO_REUSE_UNICASTPORT, SO_KEEPALIVE,
-SO_DONTROUTE may be supported depending on OS. <b><br>
+TCP_FASTOPEN, SO_REUSEADDR, SO_REUSEPORT,
+SO_EXCLUSIVEADDRUSE, SO_PORT_SCALABILITY,
+SO_REUSE_UNICASTPORT, SO_KEEPALIVE, SO_DONTROUTE may be
+supported depending on OS. SO_REUSEADDR and SO_REUSEPORT are
+set on the listening socket by default on Unix. On Windows
+SO_REUSEADDR is not set: it is not required to rebind a
+listening port and it only lets another local process bind
+the same address and port. Use SO_EXCLUSIVEADDRUSE (Windows)
+on the listening socket (<b>-ol</b>) to prevent that.
+<b><br>
 -H</b> (for all services) Expect HAProxy PROXY protocol v1
 header on incoming connection. This allows the proxy to
 receive real client IP address from HAProxy or other load
@@ -203,9 +212,16 @@ be sent before any protocol-specific data. <b><br>
 delay GRACE_DELAY milliseconds before polling if average
 polling size is below GRACE_TRAFF bytes and GRACE_NUM read
 operations in a single direction are detected within 1
-second. Useful to minimize polling <b>-s</b> <br>
+second. Useful to minimize polling <b><br>
+-s</b> <br>
 (for admin) secure, allow only secure operations, currently
 only traffic counters view without ability to reset. <br>
+(for TCP services, Linux) enable splice(). splice() is not
+built by default and is disabled even when built, because
+current Linux does not implement SPLICE_F_MOVE, so no real
+zero-copy takes place and the read/write path is faster for
+most traffic. Rebuild with -DWITHSPLICE to make -s
+available, -s0 disables it explicitly. <br>
 (for dnspr) simple, do not use resolver and 3proxy cache,
 always use external DNS server. <br>
 (for udppm) singlepacket, expect only one packet from both
@@ -220,8 +236,8 @@ information reported) <b><br>
 -a2</b> (for proxy) generate Via: and X-Forwarded-For:
 instead of Forwarded: <br>
 Also, all options mentioned for <b>proxy</b>(8)
-<b>socks</b>(8) <b>pop3p</b>(8) <b>tcppm</b>(8)
-<b>udppm</b>(8) <b>ftppr</b>(8) <br>
+<b>socks</b>(8) <b>pop3p</b>(8) <b>imapp</b>(8)
+<b>tcppm</b>(8) <b>udppm</b>(8) <b>ftppr</b>(8) <br>
 are also supported. <br>
 Portmapping services listen at SRCPORT and connect to
 DSTADDR:DSTPORT HTTP and SOCKS proxies are standard. <br>
@@ -757,10 +773,15 @@ useful). Never use this option unless you know exactly you
 need it. <b><br>
 admin</b> redirect request to local &acute;admin&acute;
 service (with -s parameter). <b><br>
-ha</b> send HAProxy PROXY protocol v1 header to parent
-proxy. Must be the last in the proxy chain. Useful for
-passing client IP information to the parent proxy. Example:
-parent 1000 ha <br>
+ha</b> send HAProxy PROXY protocol v1 header to the next
+parent proxy (or to the destination if <b>ha</b> is used
+alone). Place <b>ha</b> before the parent that should
+receive the header; after the header is sent, negotiation of
+that parent protocol continues (SOCKS, CONNECT, etc.).
+Useful for passing client IP information to the parent
+proxy. Example: <br>
+parent 1000 ha 0.0.0.0 0 <br>
+parent 1000 socks5 parent.example.com 1080 <br>
 Use &quot;+&quot; proxy only with <b>fakeresolve</b> option
 <br>
 Any parent type above can be suffixed with <b>s</b> (e.g.
@@ -779,8 +800,9 @@ special case of local redirection, it works only with
 <b>socks</b> proxy. In case of local redirection request is
 redirected to different service, <b>ftp</b> locally
 redirects to <b>ftppr pop3</b> locally redirects to <b>pop3p
-http</b> locally redirects to <b>proxy admin</b> locally
-redirects to the admin -s service. <br>
+imap</b> locally redirects to <b>imapp http</b> locally
+redirects to <b>proxy admin</b> locally redirects to the
+admin -s service. <br>
 Unix domain sockets can be used instead of IP address with
 the syntax <i>unix:/path/to/socket</i> (e.g., parent 1000
 socks5 unix:/var/run/parent.sock 1080). On Linux, abstract
@@ -1040,7 +1062,17 @@ experience 3proxy crash on request processing, try to set
 some positive value. You may start with stacksize 65536 and
 then find the minimal value for the service to work. If you
 experience memory shortage, you can try to experiment with
-negative values.</p>
+negative values. <br>
+With SQL logging (log &amp;ODBC_string) the value is
+automatically raised to 32768 if it is smaller, because ODBC
+drivers require more stack. A <b>stacksize</b> command
+placed after the <b>log</b> command overrides this. <br>
+The base stack size the value is added to is 49152. On
+FreeBSD, NetBSD, OpenBSD and DragonFly it is 65536, because
+libc functions such as vfprintf() called by syslog() use
+significantly more stack there. The result is never lowered
+below PTHREAD_STACK_MIN, so a large negative value can not
+disable the thread stack.</p>
 
 <h2>PLUGINS
 <a name="PLUGINS"></a>
@@ -1294,7 +1326,8 @@ to <b>3proxy@3proxy.org</b></p>
 
 <p style="margin-left:6%; margin-top: 1em">3proxy(8),
 3proxy_crypt(8), proxy(8), ftppr(8), socks(8), pop3p(8),
-smtpp(8), tlspr(8), tcppm(8), udppm(8), syslogd(8), <br>
+imapp(8), smtpp(8), tlspr(8), tcppm(8), udppm(8),
+syslogd(8), <br>
 https://3proxy.org/</p>
 
 <h2>AUTHORS

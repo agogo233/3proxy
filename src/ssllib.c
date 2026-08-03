@@ -14,14 +14,21 @@
 #include <sys/file.h>
 #endif
 
+#ifdef WITH_WOLFSSL
+#include <wolfssl/options.h>
+#include <wolfssl/openssl/crypto.h>
+#include <wolfssl/openssl/x509.h>
+#include <wolfssl/openssl/x509v3.h>
+#include <wolfssl/openssl/pem.h>
+#include <wolfssl/openssl/ssl.h>
+#include <wolfssl/openssl/err.h>
+#else
 #include <openssl/crypto.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
-#if OPENSSL_VERSION_NUMBER >= 0x30000000L
-#include <openssl/provider.h>
 #endif
 
 #include "proxy.h"
@@ -37,8 +44,6 @@ static char hexMap[] = {
                           '0', '1', '2', '3', '4', '5', '6', '7',
                           '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'
                         };
-
-static BIO *bio_err=NULL;
 
 
 
@@ -67,10 +72,23 @@ static size_t bin2hex (const unsigned char* bin, size_t bin_length, char* str, s
 	return p - str;
 }
 
-static int add_ext(X509 *cert, int nid, char *value)
+static int copy_ext(X509 *dst_cert, X509 *src_cert, int nid)
+{
+	X509_EXTENSION *ext;
+	int idx;
+
+	idx = X509_get_ext_by_NID(src_cert, nid, -1);
+	if(idx < 0) return 0;
+	if(!(ext = X509_get_ext(src_cert, idx))) return 0;
+	return X509_add_ext(dst_cert, ext, -1) > 0;
+}
+
+#ifndef WITH_WOLFSSL
+static int add_ext(X509 *cert, int nid, const char *value)
 {
 	X509_EXTENSION *ex;
 	X509V3_CTX ctx;
+	int err;
 	/* This sets the 'context' of the extensions. */
 	/* No configuration database */
 	X509V3_set_ctx_nodb(&ctx);
@@ -78,25 +96,16 @@ static int add_ext(X509 *cert, int nid, char *value)
 	 * no request and no CRL
 	 */
 	X509V3_set_ctx(&ctx, cert, cert, NULL, NULL, 0);
-	ex = X509V3_EXT_conf_nid(NULL, &ctx, nid, value);
+	/* value is char * prior to OpenSSL 1.1.0 */
+	ex = X509V3_EXT_conf_nid(NULL, &ctx, nid, (char *)value);
 	if (!ex)
 		return 0;
 
-	X509_add_ext(cert,ex,-1);
+	err = X509_add_ext(cert,ex,-1);
 	X509_EXTENSION_free(ex);
-	return 1;
+	return err > 0;
 }
-
-void del_ext(X509 *dst_cert, int nid, int where){
-	int ex;
-
-	ex = X509_get_ext_by_NID(dst_cert, nid, where);
-	if(ex>=0){
-		X509_EXTENSION *ext;
-		if((ext = X509_delete_ext(dst_cert, ex))) X509_EXTENSION_free(ext);
-	}
-
-}
+#endif
 
 SSL_CERT ssl_copy_cert(SSL_CERT cert, SSL_CONFIG *config)
 {
@@ -105,22 +114,18 @@ SSL_CERT ssl_copy_cert(SSL_CERT cert, SSL_CONFIG *config)
 	X509 *src_cert = (X509 *) cert;
 	X509 *dst_cert = NULL;
 
-	EVP_PKEY *pk = NULL;
-	RSA *rsa = NULL;
-
-	int hash_size = 20;
-	unsigned char hash_sha1[20];
-	char hash_name_sha1[(20*2) + 1];
+	unsigned char hash_sha256[32];
+	char hash_name_sha256[(16*2) + 1];
 	char cache_name[256];
 
-	err = X509_digest(src_cert, EVP_sha1(), hash_sha1, NULL);
+	err = X509_digest(src_cert, EVP_sha256(), hash_sha256, NULL);
 	if(!err){
 		return NULL;
 	}
 
 	if(config->certcache){
-	    bin2hex(hash_sha1, 20, hash_name_sha1, sizeof(hash_name_sha1));
-	    sprintf(cache_name, "%s%s.pem", config->certcache, hash_name_sha1);
+	    bin2hex(hash_sha256, 16, hash_name_sha256, sizeof(hash_name_sha256));
+	    sprintf(cache_name, "%s%s.pem", config->certcache, hash_name_sha256);
 	    /* check if certificate is already cached */
 	    fcache = BIO_new_file(cache_name, "rb");
 	    if ( fcache != NULL ) {
@@ -137,28 +142,67 @@ SSL_CERT ssl_copy_cert(SSL_CERT cert, SSL_CONFIG *config)
 		}
 	    }
 	}
-	/* proceed if certificate is not cached */
-	dst_cert = X509_dup(src_cert);
+	/* Build a fresh certificate instead of duplicating the source: only
+	 * the fields required for a usable server cert are copied (version,
+	 * serial, subject, validity, SAN). This avoids inheriting upstream
+	 * extensions (AKI, CRL dist points, certificate policies, ...) that
+	 * break chain validation, and works around wolfSSL's no-op
+	 * X509_delete_ext compat shim. */
+	dst_cert = X509_new();
 	if ( dst_cert == NULL ) {
 		return NULL;
 	}
-	del_ext(dst_cert, NID_crl_distribution_points, -1);
-	del_ext(dst_cert, NID_info_access, -1);
-	del_ext(dst_cert, NID_authority_key_identifier, -1);
-	del_ext(dst_cert, NID_certificate_policies, 0);
-
+	/* v3 is required, extensions are added below */
+	X509_set_version(dst_cert, 2);
+	if(!X509_set_serialNumber(dst_cert, X509_get_serialNumber(src_cert))
+	|| !X509_set_subject_name(dst_cert, X509_get_subject_name(src_cert))
+	|| !X509_set_issuer_name(dst_cert, X509_get_subject_name(config->CA_cert))){
+		X509_free(dst_cert);
+		return NULL;
+	}
 	err = X509_set_pubkey(dst_cert, config->server_key?config->server_key:config->CA_key);
 	if ( err == 0 ) {
 		X509_free(dst_cert);
 		return NULL;
 	}
-
-
-	err = X509_set_issuer_name(dst_cert, X509_get_subject_name(config->CA_cert));
-	if(!err){
+/* wolfSSL has no X509_set1_notBefore/X509_set1_notAfter before 5.7.2,
+   X509_set_notBefore/X509_set_notAfter are available in every version and
+   copy the time the same way.
+ */
+#if defined(WITH_WOLFSSL) || OPENSSL_VERSION_NUMBER < 0x10100000L
+	if(!X509_set_notBefore(dst_cert, X509_get_notBefore(src_cert))
+	|| !X509_set_notAfter(dst_cert, X509_get_notAfter(src_cert))){
+#else
+	if(!X509_set1_notBefore(dst_cert, X509_get0_notBefore(src_cert))
+	|| !X509_set1_notAfter(dst_cert, X509_get0_notAfter(src_cert))){
+#endif
 		X509_free(dst_cert);
 		return NULL;
 	}
+	/* Copy the extensions an end entity certificate is expected to have.
+	 * The extensions which break chain validation (AKI, CRL distribution
+	 * points, certificate policies, ...) are intentionally not copied.
+	 * A copy may fail: wolfSSL keeps extKeyUsage in its own form and can
+	 * not add back the one it returns, it is not fatal.
+	 */
+	copy_ext(dst_cert, src_cert, NID_subject_alt_name);
+#ifndef WITH_WOLFSSL
+	/* Without EKU serverAuth Apple's TLS stack (and Chrome on macOS/iOS,
+	 * which uses it) rejects the certificate, generate the extensions the
+	 * server certificate has no usable ones to copy. keyUsage is not set:
+	 * it depends on the type of the key reused for every generated
+	 * certificate, and an absent keyUsage places no restriction.
+	 * wolfSSL_X509V3_EXT_conf_nid() is a stub returning NULL in every
+	 * wolfSSL version, the extensions can not be generated there.
+	 */
+	if(!copy_ext(dst_cert, src_cert, NID_basic_constraints))
+		add_ext(dst_cert, NID_basic_constraints, "critical,CA:FALSE");
+	if(!copy_ext(dst_cert, src_cert, NID_ext_key_usage))
+		add_ext(dst_cert, NID_ext_key_usage, "serverAuth");
+#else
+	copy_ext(dst_cert, src_cert, NID_basic_constraints);
+	copy_ext(dst_cert, src_cert, NID_ext_key_usage);
+#endif
 	err = X509_sign(dst_cert, config->CA_key, EVP_sha256());
 	if(!err){
 		X509_free(dst_cert);
@@ -224,9 +268,17 @@ void _ssl_cert_free(SSL_CERT cert)
 
 
 
+/* OpenSSL before 1.1.0 requires the application to install threading
+   callbacks; OpenSSL >= 1.1.0 and wolfSSL handle locking internally. */
+#if !defined(WITH_WOLFSSL) && defined(OPENSSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER < 0x10100000L
+#define LEGACY_SSL_THREADING 1
+#else
+#define LEGACY_SSL_THREADING 0
+#endif
+
+#if LEGACY_SSL_THREADING
 /* This array will store all of the mutexes available to OpenSSL. */
 static _3proxy_mutex_t *mutex_buf= NULL;
-
 
 static void locking_function(int mode, int n, const char * file, int line)
 {
@@ -244,9 +296,11 @@ static unsigned long id_function(void)
   return ((unsigned long)pthread_self());
 #endif
 }
+#endif
 
 int thread_setup(void)
 {
+#if LEGACY_SSL_THREADING
   int i;
 
   mutex_buf = malloc(CRYPTO_num_locks(  ) * sizeof(_3proxy_mutex_t));
@@ -256,21 +310,7 @@ int thread_setup(void)
     _3proxy_mutex_init(mutex_buf +i);
   CRYPTO_set_id_callback(id_function);
   CRYPTO_set_locking_callback(locking_function);
-  return 1;
-}
-
-int thread_cleanup(void)
-{
-  int i;
-
-  if (!mutex_buf)
-    return 0;
-  CRYPTO_set_id_callback(NULL);
-  CRYPTO_set_locking_callback(NULL);
-  for (i = 0;  i < CRYPTO_num_locks(  );  i++)
-    _3proxy_mutex_destroy(mutex_buf +i);
-  free(mutex_buf);
-  mutex_buf = NULL;
+#endif
   return 1;
 }
 
@@ -280,33 +320,20 @@ int ssl_file_init = 0;
 
 int ssl_init_done = 0;
 
-#if OPENSSL_VERSION_NUMBER >= 0x30000000L
-extern EVP_MD *md4_hash;
-extern EVP_MD *md5_hash;
-#endif
-
-
 void ssl_init()
 {
 	if(!ssl_init_done){
-	    
+
 	    ssl_init_done = 1;
 	    thread_setup();
+#ifdef WITH_WOLFSSL
+	    wolfSSL_Init();
+#elif defined(OPENSSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x10100000L
+	    OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS, NULL);
+#else
 	    SSLeay_add_ssl_algorithms();
 	    SSL_load_error_strings();
-	    _3proxy_mutex_init(&ssl_file_mutex);
-	    bio_err=BIO_new_fp(stderr,BIO_NOCLOSE);
-#if OPENSSL_VERSION_NUMBER >= 0x30000000L
-	    OSSL_PROVIDER_load(NULL, "legacy");
-	    OSSL_PROVIDER_load(NULL, "default");
-	    md4_hash = EVP_MD_fetch(NULL, "MD4", NULL);
-	    if (md4_hash == NULL) {
-    		fprintf(stderr, "Error fetching MD4\n");
-	    }
-	    md5_hash = EVP_MD_fetch(NULL, "MD5", NULL);
-	    if (md5_hash == NULL) {
-    		fprintf(stderr, "Error fetching MD5\n");
-	    }
 #endif
+	    _3proxy_mutex_init(&ssl_file_mutex);
     	}
 }

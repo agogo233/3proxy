@@ -21,16 +21,17 @@ void * autochild(struct clientparam* param) {
     if (len != 1){
 	param->res = 801;
 	dolog(param, (unsigned char *)"");
+	return 0;
     }
     if(*param->clibuf == 4 || *param->clibuf == 5) {
 	param->service = S_SOCKS;
-	return sockschild(param);
+	return (void *)sockschild;
     }
     if(*param->clibuf == 22) {
 	param->service = S_TLSPR;
-	return tlsprchild(param);
+	return (void *)tlsprchild;
     }
     param->service = S_PROXY;
-    return proxychild(param);
+    return (void *)proxychild;
 }
 

@@ -25,6 +25,7 @@ void * dnsprchild(struct clientparam* param) {
  SASIZETYPE size;
  int res, i;
  int len;
+ int semlocked = 1;
  unsigned type=0;
  uint32_t ttl;
  unsigned char addr[16];
@@ -34,14 +35,16 @@ void * dnsprchild(struct clientparam* param) {
 
 
  if(!(bbuf = malloc(BUFSIZE+2))){
-	param->srv->fds.events = POLLIN;
 	RETURN (21);
  }
  buf = bbuf+2;
- size = sizeof(param->sincr);
- i = param->srv->so._recvfrom(param->sostate, param->srv->srvsock, (char *)buf, BUFSIZE, 0, (struct sockaddr *)&param->sincr, &size); 
  size = sizeof(param->sinsl);
  getsockname(param->srv->srvsock, (struct sockaddr *)&param->sincl, &size);
+ i = param->srv->udplen;
+ if(i > BUFSIZE) i = BUFSIZE;
+ memcpy(buf, param->srv->udpbuf, i);
+ _3proxy_sem_unlock(udpinit);
+ semlocked = 0;
 #ifdef _WIN32
 	if((param->clisock=param->srv->so._socket(param->sostate, AF_INET, SOCK_DGRAM, IPPROTO_UDP)) == INVALID_SOCKET) {
 		RETURN(818);
@@ -55,7 +58,6 @@ void * dnsprchild(struct clientparam* param) {
 #else
 	param->clisock = param->srv->srvsock;
 #endif
- param->srv->fds.events = POLLIN;
 
  if(i < 0) {
 	RETURN(813);
@@ -82,7 +84,19 @@ void * dnsprchild(struct clientparam* param) {
  *s2 = (len - (int)(s2 - buf)) - 1;
 
  type = ((unsigned)buf[len+1])*256 + (unsigned)buf[len+2];
- if((type==0x01 || type==0x1c) && !param->srv->s_option){
+ if(type==0x01 && param->srv->fakeip){
+	ip = 1;
+	ttl = 3600;
+	*(uint32_t *)addr = param->srv->fakeip;
+ }
+#ifndef NOIPV6
+ else if(type==0x1c && *(uint32_t *)param->srv->fakeip6){
+	ip = 1;
+	ttl = 3600;
+	memcpy(addr, param->srv->fakeip6, 16);
+ }
+#endif
+ else if((type==0x01 || type==0x1c) && !param->srv->s_option){
  	ip = udpresolve((type==0x1c)?AF_INET6:AF_INET, (unsigned char *)host, addr, &ttl, param, 0);
  }
 
@@ -106,8 +120,8 @@ void * dnsprchild(struct clientparam* param) {
 	len+=(type==1?16:28);
  }
  else if(type == 0x0c) {
-	unsigned a, b, c, d;
-	sscanf(host, "%u.%u.%u.%u", &a, &b, &c, &d);
+	unsigned a = 0, b = 0, c = 0, d = 0;
+	if(sscanf(host, "%u.%u.%u.%u", &a, &b, &c, &d) != 4) a = b = c = d = 0;
 	ip = htonl((d<<24) ^ (c<<16) ^ (b<<8) ^ a);
 	if(*SAFAMILY(&param->sincl) == AF_INET &&  ip == *(uint32_t *)SAADDR(&param->sincl)){
 		buf[2] = 0x85;
@@ -191,6 +205,7 @@ void * dnsprchild(struct clientparam* param) {
 
 CLEANRET:
 
+ if(semlocked) _3proxy_sem_unlock(udpinit);
  if(param->res!=813){
 	sprintf((char *)buf, "%04x/%s/", 
 			(unsigned)type,
@@ -205,7 +220,6 @@ CLEANRET:
 #ifndef _WIN32
  param->clisock = INVALID_SOCKET;
 #endif
- freeparam(param);
  return (NULL);
 }
 

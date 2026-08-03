@@ -7,7 +7,7 @@
 */
 
 #include "proxy.h"
-#include "libs/blake2.h"
+#include "mdhash.h"
 #ifdef WITH_SSL
 void ssl_install(void);
 #endif
@@ -156,7 +156,7 @@ int start_proxy_thread(struct child * chp){
 	if(h)CloseHandle(h);
 #else
 	pthread_attr_init(&pa);
-	pthread_attr_setstacksize(&pa,PTHREAD_STACK_MIN + (32768+conf.stacksize));
+	pthread_attr_setstacksize(&pa,threadstacksize(conf.stacksize));
 	pthread_attr_setdetachstate(&pa,PTHREAD_CREATE_DETACHED);
 	pthread_create(&thread, &pa, startsrv, (void *)chp);
 	pthread_attr_destroy(&pa);
@@ -191,14 +191,21 @@ static int h_proxy(int argc, unsigned char ** argv){
 		childdef.port = 110;
 		childdef.isudp = 0;
 		childdef.service = S_POP3P;
-		childdef.helpmessage = " -hdefault_host[:port] - use this host and port as default if no host specified\n";
+		childdef.helpmessage = " -hdefault_host[:port] - use this host and port as default if no host specified\n -x - disable STARTTLS\n";
+	}
+	else if(!strcmp((char *)argv[0], "imapp")) {
+		childdef.pf = imappchild;
+		childdef.port = 143;
+		childdef.isudp = 0;
+		childdef.service = S_IMAPP;
+		childdef.helpmessage = " -hdefault_host[:port] - use this host and port as default if no host specified\n -x - disable STARTTLS\n";
 	}
 	else if(!strcmp((char *)argv[0], "smtpp")) {
 		childdef.pf = smtppchild;
-		childdef.port = 25;
+		childdef.port = 587;
 		childdef.isudp = 0;
 		childdef.service = S_SMTPP;
-		childdef.helpmessage = " -hdefault_host[:port] - use this host and port as default if no host specified\n";
+		childdef.helpmessage = " -hdefault_host[:port] - use this host and port as default if no host specified\n -x - disable STARTTLS\n";
 	}
 	else if(!strcmp((char *)argv[0], "ftppr")) {
 		childdef.pf = ftpprchild;
@@ -257,7 +264,7 @@ static int h_proxy(int argc, unsigned char ** argv){
 		childdef.port = 53;
 		childdef.isudp = 1;
 		childdef.service = S_DNSPR;
-		childdef.helpmessage = " -s - simple DNS forwarding - do not use 3proxy resolver / name cache\n";
+		childdef.helpmessage = " -s - simple DNS forwarding - do not use 3proxy resolver / name cache\n -Fip - fake: answer all A queries with this IP\n";
 #ifndef NOIPV6
 		if(!resolvfunc || (resolvfunc == myresolver && !dns_table.poolsize) || resolvfunc == fakeresolver){
 			fprintf(stderr, "[line %d] Warning: no nserver/nscache configured, dnspr will not work as expected\n", linenum);
@@ -289,12 +296,19 @@ static int h_external(int argc, unsigned char ** argv){
 	else conf.extsa6 = sa6;
 #else
 	res = getip46(46, argv[1], (struct sockaddr *)&conf.extsa);
+	if(!res) return 1;
 #endif
 	return 0;
 }
 
 
-static int h_log(int argc, unsigned char ** argv){ 
+/* ODBC drivers require noticeably more stack than the file logger, raise
+   the client thread stack size unless a larger one is configured
+   explicitly. An explicit stacksize placed after the log command still wins.
+ */
+#define LOGSTACKSIZE 32768
+
+static int h_log(int argc, unsigned char ** argv){
 	unsigned char tmpbuf[8192];
 	int notchanged = 0;
 
@@ -323,6 +337,7 @@ static int h_log(int argc, unsigned char ** argv){
 #ifdef WITH_ODBC
 		else if(*argv[1]=='&'){
 			conf.logfunc = logsql;
+			if(conf.stacksize < LOGSTACKSIZE) conf.stacksize = LOGSTACKSIZE;
 			if(notchanged) return 0;
 			_3proxy_mutex_lock(&log_mutex);
 			close_sql();
@@ -503,7 +518,6 @@ static int h_auth(int argc, unsigned char **argv){
 }
 
 static int h_users(int argc, unsigned char **argv){
-    static char dummy;
     int j;
     unsigned char *arg;
     char *pw[2];
@@ -543,13 +557,17 @@ static int h_users(int argc, unsigned char **argv){
 	l = strlen(pw[1]);
 	if(l > 255) l = 255;
 	if((unsigned)l >= pwl_table.recsize) {
-	    blake2b_state S;
+	    mdh_ctx *bctx;
 	    unsigned hashsz;
+	    unsigned int blen;
 	    if(*pass != CL) continue;
 	    hashsz = pwl_table.recsize - 1 < 64 ? pwl_table.recsize - 1 : 64;
-	    blake2b_init(&S, hashsz);
-	    blake2b_update(&S, pw[1], l + 1);
-	    blake2b_final(&S, pass+1, hashsz);
+	    bctx = mdh_init(MDH_BLAKE2, hashsz);
+	    if(!bctx) continue;
+	    mdh_update(bctx, pw[1], l + 1);
+	    blen = hashsz;
+	    mdh_final(bctx, (unsigned char *)pass+1, &blen);
+	    mdh_free(bctx);
 	} else {
 	    memcpy(pass + 1, pw[1], l);
 	}
@@ -739,6 +757,7 @@ struct redirdesc redirs[] = {
     {R_SOCKS5, "socks5", sockschild},
     {R_HTTP, "http", proxychild},
     {R_POP3, "pop3", pop3pchild},
+    {R_IMAP, "imap", imappchild},
     {R_SMTP, "smtp", smtppchild},
     {R_FTP, "ftp", ftpprchild},
     {R_CONNECTP, "connect+", proxychild},
@@ -1599,88 +1618,181 @@ static int h_chroot(int argc, unsigned char **argv){
 #endif
 
 
-struct commands specificcommands[]={
-#ifndef _WIN32
-	{specificcommands+1, "setuid", h_setuid, 2, 2},
-	{specificcommands+2, "setgid", h_setgid, 2, 2},
-	{specificcommands+3, "chroot", h_chroot, 2, 4},
+#ifdef WITH_SSL
+int h_mitm(int argc, unsigned char **argv);
+int h_nomitm(int argc, unsigned char **argv);
+int h_serv(int argc, unsigned char **argv);
+int h_noserv(int argc, unsigned char **argv);
+int h_cli(int argc, unsigned char **argv);
+int h_nocli(int argc, unsigned char **argv);
+int h_certcache(int argc, unsigned char **argv);
+int h_srvcert(int argc, unsigned char **argv);
+int h_srvkey(int argc, unsigned char **argv);
+int h_clicert(int argc, unsigned char **argv);
+int h_clikey(int argc, unsigned char **argv);
+int h_client_cipher_list(int argc, unsigned char **argv);
+int h_server_cipher_list(int argc, unsigned char **argv);
+int h_client_ciphersuites(int argc, unsigned char **argv);
+int h_server_ciphersuites(int argc, unsigned char **argv);
+int h_server_ca_file(int argc, unsigned char **argv);
+int h_server_ca_key(int argc, unsigned char **argv);
+int h_client_ca_file(int argc, unsigned char **argv);
+int h_client_ca_dir(int argc, unsigned char **argv);
+int h_client_ca_store(int argc, unsigned char **argv);
+int h_client_sni(int argc, unsigned char **argv);
+int h_client_alpn(int argc, unsigned char **argv);
+int h_server_ca_dir(int argc, unsigned char **argv);
+int h_server_ca_store(int argc, unsigned char **argv);
+int h_client_min_proto_version(int argc, unsigned char **argv);
+int h_client_max_proto_version(int argc, unsigned char **argv);
+int h_server_min_proto_version(int argc, unsigned char **argv);
+int h_server_max_proto_version(int argc, unsigned char **argv);
+int h_client_verify(int argc, unsigned char **argv);
+int h_no_client_verify(int argc, unsigned char **argv);
+int h_server_verify(int argc, unsigned char **argv);
+int h_no_server_verify(int argc, unsigned char **argv);
+int h_client_mode(int argc, unsigned char **argv);
 #endif
-	{NULL, 		"", h_noop, 1, 0}
-};
+#ifdef WITH_PCRE
+int h_pcre(int argc, unsigned char **argv);
+int h_pcre_rewrite(int argc, unsigned char **argv);
+int h_pcre_extend(int argc, unsigned char **argv);
+int h_pcre_options(int argc, unsigned char **argv);
+#endif
 
 struct commands commandhandlers[]={
-	{commandhandlers+1,  "", h_noop, 1, 0},
-	{commandhandlers+2,  "proxy", h_proxy, 1, 0},
-	{commandhandlers+3,  "pop3p", h_proxy, 1, 0},
-	{commandhandlers+4,  "ftppr", h_proxy, 1, 0},
-	{commandhandlers+5,  "socks", h_proxy, 1, 0},
-	{commandhandlers+6,  "tcppm", h_proxy, 4, 0},
-	{commandhandlers+7,  "udppm", h_proxy, 4, 0},
-	{commandhandlers+8,  "admin", h_proxy, 1, 0},
-	{commandhandlers+9,  "dnspr", h_proxy, 1, 0},
-	{commandhandlers+10,  "internal", h_internal, 2, 2},
-	{commandhandlers+11, "external", h_external, 2, 2},
-	{commandhandlers+12, "log", h_log, 1, 0},
-	{commandhandlers+13, "service", h_service, 1, 1},
-	{commandhandlers+14, "daemon", h_daemon, 1, 1},
-	{commandhandlers+15, "config", h_config, 2, 2},
-	{commandhandlers+16, "include", h_include, 2, 2},
-	{commandhandlers+17, "archiver", h_archiver, 3, 0},
-	{commandhandlers+18, "counter", h_counter, 2, 4},
-	{commandhandlers+19, "rotate", h_rotate, 2, 2},
-	{commandhandlers+20, "logformat", h_logformat, 2, 2},
-	{commandhandlers+21, "timeouts", h_timeouts, 2, 0},
-	{commandhandlers+22, "auth", h_auth, 2, 0},
-	{commandhandlers+23, "users", h_users, 1, 0},
-	{commandhandlers+24, "maxconn", h_maxconn, 2, 2},
-	{commandhandlers+25, "flush", h_flush, 1, 1},
-	{commandhandlers+26, "nserver", h_nserver, 2, 2},
-	{commandhandlers+27, "fakeresolve", h_fakeresolve, 1, 1},
-	{commandhandlers+28, "nscache", h_nscache, 2, 2},
-	{commandhandlers+29, "nscache6", h_nscache6, 2, 2},
-	{commandhandlers+30, "nsrecord", h_nsrecord, 3, 3},
-	{commandhandlers+31, "dialer", h_dialer, 2, 2},
-	{commandhandlers+32, "system", h_system, 2, 2},
-	{commandhandlers+33, "pidfile", h_pidfile, 2, 2},
-	{commandhandlers+34, "monitor", h_monitor, 2, 2},
-	{commandhandlers+35, "parent", h_parent, 5, 0},
-	{commandhandlers+36, "allow", h_ace, 1, 0},
-	{commandhandlers+37, "deny", h_ace, 1, 0},
-	{commandhandlers+38, "redirect", h_ace, 3, 0},
-	{commandhandlers+39, "bandlimin", h_ace, 2, 0},
-	{commandhandlers+40, "bandlimout", h_ace, 2, 0},
-	{commandhandlers+41, "nobandlimin", h_ace, 1, 0},
-	{commandhandlers+42, "nobandlimout", h_ace, 1, 0},
-	{commandhandlers+43, "countin", h_ace, 4, 0},
-	{commandhandlers+44, "nocountin", h_ace, 1, 0},
-	{commandhandlers+45, "countout", h_ace, 4, 0},
-	{commandhandlers+46, "nocountout", h_ace, 1, 0},
-	{commandhandlers+47, "countall", h_ace, 4, 0},
-	{commandhandlers+48, "nocountall", h_ace, 1, 0},
-	{commandhandlers+49, "connlim", h_ace, 4, 0},
-	{commandhandlers+50, "noconnlim", h_ace, 1, 0},
-	{commandhandlers+51, "plugin", h_plugin, 3, 0},
-	{commandhandlers+52, "logdump", h_logdump, 2, 3},
-	{commandhandlers+53, "filtermaxsize", h_filtermaxsize, 2, 2},
-	{commandhandlers+54, "nolog", h_nolog, 1, 1},
-	{commandhandlers+55, "weight", h_nolog, 2, 2},
-	{commandhandlers+56, "authcache", h_authcache, 2, 4},
-	{commandhandlers+57, "smtpp", h_proxy, 1, 0},
-	{commandhandlers+58, "delimchar",h_delimchar, 2, 2},
-	{commandhandlers+59, "authnserver", h_authnserver, 2, 2},
-	{commandhandlers+60, "stacksize", h_stacksize, 2, 2},
-	{commandhandlers+61, "force", h_force, 1, 1},
-	{commandhandlers+62, "noforce", h_noforce, 1, 1},
-	{commandhandlers+63, "parentretries", h_parentretries, 2, 2},
-	{commandhandlers+64, "auto", h_proxy, 1, 0},
-	{commandhandlers+65, "backlog", h_backlog, 2, 2},
-	{commandhandlers+66, "tlspr", h_proxy, 1, 0},
-	{commandhandlers+67, "maxseg", h_maxseg, 2, 2},
+	{NULL,  "", h_noop, 1, 0},
+	{NULL,  "proxy", h_proxy, 1, 0},
+	{NULL,  "pop3p", h_proxy, 1, 0},
+	{NULL,  "imapp", h_proxy, 1, 0},
+	{NULL,  "ftppr", h_proxy, 1, 0},
+	{NULL,  "socks", h_proxy, 1, 0},
+	{NULL,  "tcppm", h_proxy, 4, 0},
+	{NULL,  "udppm", h_proxy, 4, 0},
+	{NULL,  "admin", h_proxy, 1, 0},
+	{NULL,  "dnspr", h_proxy, 1, 0},
+	{NULL,  "internal", h_internal, 2, 2},
+	{NULL, "external", h_external, 2, 2},
+	{NULL, "log", h_log, 1, 0},
+	{NULL, "service", h_service, 1, 1},
+	{NULL, "daemon", h_daemon, 1, 1},
+	{NULL, "config", h_config, 2, 2},
+	{NULL, "include", h_include, 2, 2},
+	{NULL, "archiver", h_archiver, 3, 0},
+	{NULL, "counter", h_counter, 2, 4},
+	{NULL, "rotate", h_rotate, 2, 2},
+	{NULL, "logformat", h_logformat, 2, 2},
+	{NULL, "timeouts", h_timeouts, 2, 0},
+	{NULL, "auth", h_auth, 2, 0},
+	{NULL, "users", h_users, 1, 0},
+	{NULL, "maxconn", h_maxconn, 2, 2},
+	{NULL, "flush", h_flush, 1, 1},
+	{NULL, "nserver", h_nserver, 2, 2},
+	{NULL, "fakeresolve", h_fakeresolve, 1, 1},
+	{NULL, "nscache", h_nscache, 2, 2},
+	{NULL, "nscache6", h_nscache6, 2, 2},
+	{NULL, "nsrecord", h_nsrecord, 3, 3},
+	{NULL, "dialer", h_dialer, 2, 2},
+	{NULL, "system", h_system, 2, 2},
+	{NULL, "pidfile", h_pidfile, 2, 2},
+	{NULL, "monitor", h_monitor, 2, 2},
+	{NULL, "parent", h_parent, 5, 0},
+	{NULL, "allow", h_ace, 1, 0},
+	{NULL, "deny", h_ace, 1, 0},
+	{NULL, "redirect", h_ace, 3, 0},
+	{NULL, "bandlimin", h_ace, 2, 0},
+	{NULL, "bandlimout", h_ace, 2, 0},
+	{NULL, "nobandlimin", h_ace, 1, 0},
+	{NULL, "nobandlimout", h_ace, 1, 0},
+	{NULL, "countin", h_ace, 4, 0},
+	{NULL, "nocountin", h_ace, 1, 0},
+	{NULL, "countout", h_ace, 4, 0},
+	{NULL, "nocountout", h_ace, 1, 0},
+	{NULL, "countall", h_ace, 4, 0},
+	{NULL, "nocountall", h_ace, 1, 0},
+	{NULL, "connlim", h_ace, 4, 0},
+	{NULL, "noconnlim", h_ace, 1, 0},
+	{NULL, "plugin", h_plugin, 3, 0},
+	{NULL, "logdump", h_logdump, 2, 3},
+	{NULL, "filtermaxsize", h_filtermaxsize, 2, 2},
+	{NULL, "nolog", h_nolog, 1, 1},
+	{NULL, "weight", h_nolog, 2, 2},
+	{NULL, "authcache", h_authcache, 2, 4},
+	{NULL, "smtpp", h_proxy, 1, 0},
+	{NULL, "delimchar",h_delimchar, 2, 2},
+	{NULL, "authnserver", h_authnserver, 2, 2},
+	{NULL, "stacksize", h_stacksize, 2, 2},
+	{NULL, "force", h_force, 1, 1},
+	{NULL, "noforce", h_noforce, 1, 1},
+	{NULL, "parentretries", h_parentretries, 2, 2},
+	{NULL, "auto", h_proxy, 1, 0},
+	{NULL, "backlog", h_backlog, 2, 2},
+	{NULL, "tlspr", h_proxy, 1, 0},
+	{NULL, "maxseg", h_maxseg, 2, 2},
 #ifndef NORADIUS
-	{commandhandlers+68, "radius", h_radius, 3, 0},
+	{NULL, "radius", h_radius, 3, 0},
 #endif
-	{specificcommands, 	 "", h_noop, 1, 0}
+#ifndef _WIN32
+	{NULL, "setuid", h_setuid, 2, 2},
+	{NULL, "setgid", h_setgid, 2, 2},
+	{NULL, "chroot", h_chroot, 2, 4},
+#endif
+#ifdef WITH_SSL
+	{NULL, "ssl_mitm", h_mitm, 1, 1},
+	{NULL, "ssl_nomitm", h_nomitm, 1, 1},
+	{NULL, "ssl_serv", h_serv, 1, 1},
+	{NULL, "ssl_noserv", h_noserv, 1, 1},
+	{NULL, "ssl_server_cert", h_srvcert, 1, 2},
+	{NULL, "ssl_server_key", h_srvkey, 1, 2},
+	{NULL, "ssl_server_ca_file", h_server_ca_file, 1, 2},
+	{NULL, "ssl_server_ca_key", h_server_ca_key, 1, 2},
+	{NULL, "ssl_client_ca_file", h_client_ca_file, 1, 2},
+	{NULL, "ssl_client_ca_dir", h_client_ca_dir, 1, 2},
+	{NULL, "ssl_client_ca_store", h_client_ca_store, 1, 2},
+	{NULL, "ssl_client_ciphersuites", h_client_ciphersuites, 1, 2},
+	{NULL, "ssl_server_ciphersuites", h_server_ciphersuites, 1, 2},
+	{NULL, "ssl_client_cipher_list", h_client_cipher_list, 1, 2},
+	{NULL, "ssl_server_cipher_list", h_server_cipher_list, 1, 2},
+	{NULL, "ssl_client_min_proto_version", h_client_min_proto_version, 1, 2},
+	{NULL, "ssl_server_min_proto_version", h_server_min_proto_version, 1, 2},
+	{NULL, "ssl_client_max_proto_version", h_client_max_proto_version, 1, 2},
+	{NULL, "ssl_server_max_proto_version", h_server_max_proto_version, 1, 2},
+	{NULL, "ssl_client_verify", h_client_verify, 1, 1},
+	{NULL, "ssl_client_no_verify", h_no_client_verify, 1, 1},
+	{NULL, "ssl_cli", h_cli, 1, 1},
+	{NULL, "ssl_nocli", h_nocli, 1, 1},
+	{NULL, "ssl_client_cert", h_clicert, 1, 2},
+	{NULL, "ssl_client_key", h_clikey, 1, 2},
+	{NULL, "ssl_server", h_serv, 1, 1},
+	{NULL, "ssl_noserver", h_noserv, 1, 1},
+	{NULL, "ssl_client", h_cli, 1, 1},
+	{NULL, "ssl_noclient", h_nocli, 1, 1},
+	{NULL, "ssl_server_verify", h_server_verify, 1, 1},
+	{NULL, "ssl_server_no_verify", h_no_server_verify, 1, 1},
+	{NULL, "ssl_server_ca_dir", h_server_ca_dir, 1, 2},
+	{NULL, "ssl_server_ca_store", h_server_ca_store, 1, 2},
+	{NULL, "ssl_client_sni", h_client_sni, 1, 2},
+	{NULL, "ssl_client_alpn", h_client_alpn, 1, 0},
+	{NULL, "ssl_client_mode", h_client_mode, 1, 2},
+	{NULL, "ssl_certcache", h_certcache, 2, 2},
+#endif
+#ifdef WITH_PCRE
+	{NULL, "pcre", h_pcre, 4, 0},
+	{NULL, "pcre_rewrite", h_pcre_rewrite, 5, 0},
+	{NULL, "pcre_extend", h_pcre_extend, 2, 0},
+	{NULL, "pcre_options", h_pcre_options, 2, 0},
+#endif
+	{NULL, 	 "", h_noop, 1, 0}
 };
+
+void initcommands(void){
+	static int initialized = 0;
+	unsigned i;
+	if(initialized) return;
+	initialized = 1;
+	for(i = 0; i + 1 < sizeof(commandhandlers)/sizeof(commandhandlers[0]); i++)
+		commandhandlers[i].next = commandhandlers + i + 1;
+}
 
 int parsestr (unsigned char *str, unsigned char **argm, int nitems, unsigned char ** buff, int *inbuf, int *bufsize){
 #define buf (*buff)
@@ -1913,7 +2025,7 @@ void freeconf(struct extparam *confp){
 #endif
  *SAFAMILY(&confp->intsa) = AF_INET;
  *SAFAMILY(&confp->extsa) = AF_INET;
- confp->maxchild = 100;
+ confp->maxchild = DEFAULT_MAXCHILD;
  confp->backlog = 0;
  resolvfunc = NULL;
  numservers = 0;

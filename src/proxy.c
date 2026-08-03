@@ -240,13 +240,20 @@ void * proxychild(struct clientparam* param) {
  int keepalive = 0;
  uint64_t contentlength64 = 0;
  int hascontent =0;
+ int clhdrofs = -1;
+ int chunkedcli = 0;
+ int clhdrofs_req = -1;
  int isconnect = 0;
  int redirect = 0;
  int prefix = 0, ckeepalive=0;
  int ftp = 0;
+#ifndef ANONYMOUS
  int anonymous;
+#endif
  int sleeptime = 0;
+#ifndef WITHMAIN
  int reqsize, reqbufsize;
+#endif
  int authenticate;
  struct pollfd fds[2];
  SOCKET ftps;
@@ -262,10 +269,15 @@ void * proxychild(struct clientparam* param) {
  if(param->remsock != INVALID_SOCKET) haveconnection = 1; 
  if(!(buf = malloc(BUFSIZE))) {RETURN(21);}
  bufsize = BUFSIZE;
+#ifndef ANONYMOUS
  anonymous = param->srv->anonymous;
+#endif
 for(;;){
  memset(buf, 0, bufsize);
  inbuf = 0;
+ chunkedcli = 0;
+ clhdrofs_req = -1;
+ param->nolongdatfilter = 0;
 
 
  if(keepalive && (param->cliinbuf == param->clioffset) && (param->remsock != INVALID_SOCKET)){
@@ -413,6 +425,10 @@ for(;;){
 				param->password = (unsigned char *)strdup((char *)sb+1);
 				param->pwtype = 0;
 			}
+			else if(param->password){
+				free(param->password);
+				param->password = NULL;
+			}
 			if(param->username)free(param->username);
 			param->username = (unsigned char *)strdup((char *)username);
 			continue;
@@ -458,13 +474,14 @@ for(;;){
 			if(parsehostname((char *)sb, param, 80)) RETURN(100);
 		}
 		newbuf = malloc(strlen((char *)req) + strlen((char *)(buf+inbuf)) + 8);
-		if(newbuf){
-			sp = (unsigned char *)strchr((char *)req+1, '/');
+		sp = (unsigned char *)strchr((char *)req+1, '/');
+		if(newbuf && sp){
 			memcpy(newbuf, req, (sp - req));
 			sprintf((char*)newbuf + (sp - req), "http://%s%s",sb,sp);
 			free(req);
 			req = newbuf;
 		}
+		else if(newbuf) free(newbuf);
 		if(se)*se = c;
 	}
 	if(ftp && i > 13 && (!strncasecmp((char *)(buf+inbuf), "authorization", 13))){
@@ -485,12 +502,17 @@ for(;;){
 				if(param->extpassword)free(param->extpassword);
 				param->extpassword = (unsigned char *)strdup((char *)sb+1);
 			}
+			else if(param->extpassword){
+				free(param->extpassword);
+				param->extpassword = NULL;
+			}
 			if(param->extusername)free(param->extusername);
 			param->extusername = (unsigned char *)strdup((char *)username);
 			continue;
 		}
 	}
 	if(i> 15 && (!strncasecmp((char *)(buf+inbuf), "content-length", 14))){
+		if(chunkedcli) continue;
 		sb = (unsigned char *)strchr((char *)(buf+inbuf), ':');
 		if(!sb)continue;
 		++sb;
@@ -500,6 +522,23 @@ for(;;){
 			RETURN(10);
 		}
 		if(param->ndatfilterscli > 0 && contentlength64 > 0) continue;
+		clhdrofs_req = inbuf;
+	}
+	else if(i>25 && (!strncasecmp((char *)(buf+inbuf), "transfer-encoding", 17))){
+		sb = (unsigned char *)strchr((char *)(buf+inbuf), ':');
+		if(sb){
+			++sb;
+			while(isspace(*sb))sb++;
+			if(!strncasecmp((char *)sb, "chunked", 7)){
+				chunkedcli = 1;
+				if(clhdrofs_req >= 0){
+					buf[clhdrofs_req] = 'X';
+					clhdrofs_req = -1;
+				}
+				contentlength64 = 0;
+				param->nolongdatfilter = 1;
+			}
+		}
 	}
 	inbuf += i;
 	if((bufsize - inbuf) < LINESIZE){
@@ -515,8 +554,10 @@ for(;;){
 
  buf[inbuf] = 0;
 
+#ifndef WITHMAIN
  reqsize = (int)strlen((char *)req);
  reqbufsize = reqsize + 1;
+#endif
 
 
  if(param->srv->needuser > 1 && !param->username) {RETURN(4);}
@@ -565,7 +606,7 @@ for(;;){
  if (conf.filtermaxsize && contentlength64 > (uint64_t)conf.filtermaxsize) {
 	param->nolongdatfilter = 1;
  }
- else if(param->ndatfilterscli > 0 && contentlength64 > 0){
+ else if(param->ndatfilterscli > 0 && contentlength64 > 0 && contentlength64 == (uint64_t)(unsigned long)contentlength64){
   uint64_t newlen64;
   newlen64 = (uint64_t) sockfillbuffcli(param, (unsigned long)contentlength64, CONNECTION_S);
   if(newlen64 == contentlength64) {
@@ -668,7 +709,6 @@ for(;;){
 			int sizetoken =-1;
 			int modetoken =-1;
 			int datetoken =-1;
-			int spaces = 1;
 			unsigned char * tokens[10];
 			unsigned wordlen [10];
 			unsigned char j=0;
@@ -701,7 +741,6 @@ for(;;){
 				wordlen[datetoken] = ((unsigned)(tokens[1] - tokens[0])) + wordlen[1];
 				sizetoken = 2;
 				filetoken = 3;
-				spaces = 10;
 			}
 			else {
 				if(j < 8 || wordlen[0]!=10) continue;
@@ -831,7 +870,7 @@ for(;;){
  if(isconnect && param->redirtype != R_HTTP) {
 	if(param->redirectfunc) {
 		freeptr(&req); freeptr(&buf); freeptr(&ftpbase);
-		return (*param->redirectfunc)(param);
+		return (void *)param->redirectfunc;
 	}
 	param->res =  mapsocket(param, conf.timeouts[CONNECTION_L]);
 	RETURN(param->res);
@@ -906,12 +945,47 @@ for(;;){
  if(param->bandlimfunc) {
 	sleeptime = param->bandlimfunc(param, 0, (int)strlen((char *)buf));
  }
- if(contentlength64 > 0){
+ if(chunkedcli || contentlength64 > 0){
+	if(chunkedcli){
+		do {
+			unsigned char smallbuf[32];
+			while ((i = sockgetlinebuf(param, CLIENT, smallbuf, 30, '\n', conf.timeouts[STRING_S])) == 2) {
+				if (socksend(param, param->remsock, smallbuf, i, conf.timeouts[STRING_S]) != i) RETURN(536);
+				if(chunkedcli == 2) break;
+			}
+			if(i<3) break;
+			if (socksend(param, param->remsock, smallbuf, i, conf.timeouts[STRING_S]) != i) RETURN(536);
+			if(chunkedcli == 2) {
+				if((i = sockgetlinebuf(param, CLIENT, smallbuf, 30, '\n', conf.timeouts[STRING_S])) != 2) RETURN(537);
+				if (socksend(param, param->remsock, smallbuf, i, conf.timeouts[STRING_S]) != i) RETURN(536);
+				break;
+			}
+			smallbuf[i] = 0;
+			contentlength64 = 0;
+			if(sscanf((char *)smallbuf, "%"SCNx64"", &contentlength64) != 1) RETURN(537);
+			/* chunk-size line may be longer than smallbuf: drain and relay the
+			   remainder up to LF so client/backend framing stays in sync */
+			while(i > 0 && smallbuf[i-1] != '\n'){
+				if((i = sockgetlinebuf(param, CLIENT, smallbuf, 30, '\n', conf.timeouts[STRING_S])) <= 0) RETURN(537);
+				if (socksend(param, param->remsock, smallbuf, i, conf.timeouts[STRING_S]) != i) RETURN(536);
+			}
+			if(contentlength64 == 0) chunkedcli = 2;
+			else {
+				param->waitclient64 = contentlength64;
+				res = mapsocket(param, conf.timeouts[CONNECTION_S]);
+				param->waitclient64 = 0;
+				if(res != 99) RETURN(res);
+			}
+		} while(chunkedcli);
+		res = 99;
+	}
+	else {
 	 param->waitclient64 = contentlength64;
 	 res = mapsocket(param, conf.timeouts[CONNECTION_S]);
 	 param->waitclient64 = 0;
 	 if(res != 99) {
 		RETURN(res);
+	}
 	}
  }
  contentlength64 = 0;
@@ -921,6 +995,7 @@ for(;;){
  authenticate = 0;
  param->chunked = 0;
  hascontent = 0;
+ clhdrofs = -1;
  
  while( (i = sockgetlinebuf(param, SERVER, buf + inbuf, LINESIZE - 1, '\n', conf.timeouts[(res)?STRING_S:STRING_L])) > 2) {
 	if(!res && i>9)param->status = res = atoi((char *)buf + inbuf + 9);
@@ -942,6 +1017,7 @@ for(;;){
 		authenticate = 1;
 	}
 	else if(i > 15 && (!strncasecmp((char *)(buf+inbuf), "content-length", 14))){
+		if(param->chunked) continue;
 		buf[inbuf+i]=0;
 		sb = (unsigned char *)strchr((char *)(buf+inbuf), ':');
 		if(!sb)continue;
@@ -949,6 +1025,7 @@ for(;;){
 		while(isspace(*sb))sb++;
 		sscanf((char *)sb, "%"SCNu64"", &contentlength64);
 		hascontent = 1;
+		clhdrofs = inbuf;
 		if(param->unsafefilter && param->ndatfilterssrv > 0) {
 			hascontent = 2;
 			continue;
@@ -965,6 +1042,12 @@ for(;;){
 		while(isspace(*sb))sb++;
 		if(!strncasecmp((char *)sb, "chunked", 7)){
 			param->chunked = 1;
+			if(clhdrofs >= 0){
+				buf[clhdrofs] = 'X';
+				clhdrofs = -1;
+				contentlength64 = 0;
+				hascontent = 0;
+			}
 		}
 	}
 	inbuf += i;
@@ -1009,7 +1092,7 @@ for(;;){
  if (conf.filtermaxsize && contentlength64 > (uint64_t)conf.filtermaxsize) {
 	param->nolongdatfilter = 1;
  }
- else if(param->ndatfilterssrv > 0 && contentlength64 > 0 && param->operation != HTTP_HEAD && res != 204 && res != 304){
+ else if(param->ndatfilterssrv > 0 && contentlength64 > 0 && contentlength64 == (uint64_t)(unsigned long)contentlength64 && param->operation != HTTP_HEAD && res != 204 && res != 304){
   uint64_t newlen;
   newlen = (uint64_t)sockfillbuffsrv(param, (unsigned long) contentlength64, CONNECTION_S);
   if(newlen == contentlength64) {
@@ -1073,7 +1156,16 @@ for(;;){
 			}
 			smallbuf[i] = 0;
 			contentlength64 = 0;
-			sscanf((char *)smallbuf, "%"SCNx64"", &contentlength64);
+			if(sscanf((char *)smallbuf, "%"SCNx64"", &contentlength64) != 1) {
+				keepalive = 0;
+				break;
+			}
+			/* chunk-size line may be longer than smallbuf: drain and relay the
+			   remainder up to LF so client/backend framing stays in sync */
+			while(i > 0 && smallbuf[i-1] != '\n'){
+				if((i = sockgetlinebuf(param, SERVER, smallbuf, 30, '\n', conf.timeouts[STRING_S])) <= 0) RETURN(534);
+				if (socksend(param, param->clisock, smallbuf, i, conf.timeouts[STRING_S]) != i) RETURN(535);
+			}
 			if(contentlength64 == 0) {
 				param->chunked = 2;
 			}
@@ -1140,7 +1232,6 @@ CLEANRET:
  }
  logurl(param, (char *)buf, (char *)req, ftp);
  freeptr(&req); freeptr(&buf); freeptr(&ftpbase);
- freeparam(param);
  return (NULL);
 }
 
