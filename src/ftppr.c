@@ -64,6 +64,13 @@ void * ftpprchild(struct clientparam* param) {
 
 	}
 	else if (!strncasecmp((char *)buf, "PASS ", 5)){
+		/* The user name carries the server to log in to, and it arrives
+		   with USER. Without it there is nothing to log in to, and what
+		   follows would read the name and the host as if there were. */
+		if(!param->hostname || !param->extusername){
+			socksend(param, param->ctrlsock, (unsigned char *)"503 Login with USER first\r\n", 27, conf.timeouts[STRING_S]);
+			RETURN(805);
+		}
 		param->extpassword = (unsigned char *)strdup((char *)buf+5);
 		inbuf = BUFSIZE;
 		res = ftplogin(param, (char *)buf, &inbuf);
@@ -121,7 +128,7 @@ void * ftpprchild(struct clientparam* param) {
 		}
 		if ((clidatasock=socket(SASOCK(&param->sincl), SOCK_STREAM, IPPROTO_TCP)) == INVALID_SOCKET) {RETURN(821);}
 		*SAPORT(&param->sincl) = 0;
-		if(param->srv->so._bind(param->sostate, clidatasock, (struct sockaddr *)&param->sincl, SASIZE(&param->sincl))){RETURN(822);}
+		if(bindwithrange(param, clidatasock, &param->sincl, param->intport)){RETURN(822);}
 		if (pasv) {
 			if(param->srv->so._listen(param->sostate, clidatasock, 1)) {RETURN(823);}
 			sasize = sizeof(param->sincl);

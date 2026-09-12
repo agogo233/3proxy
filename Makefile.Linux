@@ -25,6 +25,13 @@ LDFLAGS += -fno-strict-aliasing -pthread
 # makefile, including the += above and the STATIC/LIBSTATIC handling below.
 CFLAGS += $(EXTRA_CFLAGS)
 LDFLAGS += $(EXTRA_LDFLAGS)
+# The HTTP server serves the endpoints declared by http lines. The admin
+# interface is built on top of it, so turning it off removes both.
+HTTPSRV ?= true
+ifeq ($(HTTPSRV),true)
+    CFLAGS += -DWITH_HTTPSRV
+    HTTPSRV_OBJS = srvhttpsrv$(OBJSUFFICS) srvwebadmin$(OBJSUFFICS)
+endif
 DLFLAGS ?= -shared
 DLSUFFICS = .ld.so
 # -lpthreads may be reuqired on some platforms instead of -pthreads
@@ -43,8 +50,12 @@ MAKEFILE = Makefile.Linux
 # PamAuth requires libpam, you may require pam-devel package to be installed
 # SSLPlugin requires  -lcrypto -lssl
 #LIBS = -lcrypto -lssl -ldl 
-#PLUGINS = SSLPlugin StringsPlugin TrafficPlugin PCREPlugin TransparentPlugin PamAuth
-PLUGINS ?= StringsPlugin TrafficPlugin TransparentPlugin FilePlugin
+#PLUGINS = StringsPlugin TrafficPlugin PamAuth LdapPlugin
+PLUGINS ?= StringsPlugin TrafficPlugin FilePlugin
+
+# Transparent proxying, built in: it needs the packet filter of the platform
+CFLAGS += -DWITH_TRANSPARENT
+TRANSPARENT_OBJS = transparent$(OBJSUFFICS)
 ifeq ($(STATIC), true)
     LDFLAGS += -static
     CFLAGS += -DNOPLUGINS -DNOSTDRESOLVE -DNOCRYPT
@@ -60,14 +71,14 @@ ifeq ($(LIBSTATIC), true)
     ZLIB = -lz -lzstd
 endif
 
-WOLFSSL_CHECK ?= $(shell echo "\#include <wolfssl/options.h>\\n\#include <wolfssl/openssl/ssl.h>\\n int main(){return 0;}" | tr -d \\\\ | $(CC) -x c $(CFLAGS) -o testwssl.o - 2>/dev/null && $(CC) $(LDFLAGS) -otestwssl testwssl.o $(STATIC_PREFIX) -lwolfssl $(STATIC_SUFFIX) 2>/dev/null && rm testwssl testwssl.o && echo true||echo false)
+WOLFSSL_CHECK ?= $(shell printf "\#include <wolfssl/options.h>\\n\#include <wolfssl/openssl/ssl.h>\\n int main(){return 0;}" | tr -d \\\\ | $(CC) -x c $(CFLAGS) -o testwssl.o - 2>/dev/null && $(CC) $(LDFLAGS) -otestwssl testwssl.o $(STATIC_PREFIX) -lwolfssl $(STATIC_SUFFIX) 2>/dev/null && rm testwssl testwssl.o && echo true||echo false)
 ifeq ($(WOLFSSL_CHECK), true)
     LIBS += $(STATIC_PREFIX) -lwolfssl $(STATIC_SUFFIX)
     CFLAGS += -DWITH_SSL -DWITH_WOLFSSL
     SSL_OBJS = ssllib$(OBJSUFFICS) ssl$(OBJSUFFICS)
     ZLIB :=
 else
-OPENSSL_CHECK ?= $(shell echo "\#include <openssl/ssl.h>\\n int main(){return 0;}" | tr -d \\\\ | $(CC) -x c $(CFLAGS) -o testssl.o - 2>/dev/null && $(CC) $(LDFLAGS) -otestssl testssl.o $(STATIC_PREFIX) $(ZLIB) -lcrypto -lssl  $(STATIC_SUFFIX) 2>/dev/null && rm testssl testssl.o && echo true||echo false)
+OPENSSL_CHECK ?= $(shell printf "\#include <openssl/ssl.h>\\n int main(){return 0;}" | tr -d \\\\ | $(CC) -x c $(CFLAGS) -o testssl.o - 2>/dev/null && $(CC) $(LDFLAGS) -otestssl testssl.o $(STATIC_PREFIX) $(ZLIB) -lcrypto -lssl  $(STATIC_SUFFIX) 2>/dev/null && rm testssl testssl.o && echo true||echo false)
 ifeq ($(OPENSSL_CHECK), true)
     LIBS += $(STATIC_PREFIX) $(ZLIB) -lcrypto -lssl $(STATIC_SUFFIX)
     CFLAGS += -DWITH_SSL
@@ -76,13 +87,13 @@ else
     ZLIB :=
 endif
 endif
-PCRE_CHECK ?= $(shell echo "\#define PCRE2_CODE_UNIT_WIDTH 8\\n\#include <pcre2.h>\\n int main(){return 0;}" | tr -d \\\\ | $(CC) -x c $(CFLAGS) -o testpcre.o - 2>/dev/null && $(CC) -o testpcre testpcre.o $(LDFLAGS) $(STATIC_PREFIX) -lpcre2-8 $(STATIC_SUFFIX) 2>/dev/null && rm testpcre testpcre.o && echo true||echo false)
+PCRE_CHECK ?= $(shell printf "\#define PCRE2_CODE_UNIT_WIDTH 8\\n\#include <pcre2.h>\\n int main(){return 0;}" | tr -d \\\\ | $(CC) -x c $(CFLAGS) -o testpcre.o - 2>/dev/null && $(CC) -o testpcre testpcre.o $(LDFLAGS) $(STATIC_PREFIX) -lpcre2-8 $(STATIC_SUFFIX) 2>/dev/null && rm testpcre testpcre.o && echo true||echo false)
 ifeq ($(PCRE_CHECK), true)
     CFLAGS += -DWITH_PCRE
     PCRE_OBJS = pcre$(OBJSUFFICS)
     PCRE_LIBS = $(STATIC_PREFIX) -lpcre2-8 $(STATIC_SUFFIX)
 endif
-PAM_CHECK ?= $(shell echo "\#include <security/pam_appl.h>\\n int main(){return 0;}" | tr -d \\\\ | $(CC) -x c $(CFLAGS) -o testpam.o - 2>/dev/null && $(CC) $(LDFLAGS) -o testpam testpam.o -lpam 2>/dev/null && rm testpam testpam.o && echo true||echo false)
+PAM_CHECK ?= $(shell printf "\#include <security/pam_appl.h>\\n int main(){return 0;}" | tr -d \\\\ | $(CC) -x c $(CFLAGS) -o testpam.o - 2>/dev/null && $(CC) $(LDFLAGS) -o testpam testpam.o -lpam 2>/dev/null && rm testpam testpam.o && echo true||echo false)
 ifeq ($(PAM_CHECK), true)
     PLUGINS += PamAuth
 endif
@@ -104,7 +115,7 @@ INSTALL_OBJS	= bin/3proxy \
 		  bin/$(CRYPT_PREFIX)crypt \
 		  bin/$(PREFIX)ftppr \
 		  bin/$(PREFIX)imapp \
-	  bin/$(PREFIX)pop3p \
+		  bin/$(PREFIX)pop3p \
 		  bin/$(PREFIX)proxy \
 		  bin/$(PREFIX)smtpp \
 		  bin/$(PREFIX)socks \

@@ -135,8 +135,41 @@ void daemonize(void);
 #endif
 #endif
 
+/* wolfSSL reserves around 48K of static thread-local storage. glibc counts
+   that against the thread stack, so pthread_create() fails with EINVAL and
+   no thread starts at all. musl places the block next to the stack instead
+   of inside it and needs nothing extra, and OpenSSL has no static TLS.
+   musl identifies itself by no macro of its own, but it does not define
+   __GLIBC__, which any libc header pulled in above would have set.
+ */
+#ifndef TLSSTACKSIZE
+#if defined(__linux__) && !defined(__GLIBC__)
+#define TLSSTACKSIZE 0
+#elif defined(WITH_WOLFSSL)
+#define TLSSTACKSIZE 49152
+#else
+#define TLSSTACKSIZE 0
+#endif
+#endif
+
+/* A UDP service answers from the address the client sent to, so the reply has
+   to leave the listening socket. Sharing that socket with the request handler
+   is the simple way, and what every Unix build does.
+
+   Older Windows cannot have two operations in flight on one socket, so a
+   build for it binds a second socket to the same address instead, which needs
+   SO_REUSEADDR on the listening socket as well. A build for those versions
+   asks for that with NO_SHARE_UDP_SOCKET, as Makefile.watcom does.
+ */
+#ifndef SHARE_UDP_SOCKET
+#ifndef NO_SHARE_UDP_SOCKET
+#define SHARE_UDP_SOCKET
+#endif
+#endif
+
 #ifndef _WIN32
 size_t threadstacksize(int extra);
+
 #endif
 
 #ifdef WITH_ODBC
@@ -204,6 +237,11 @@ extern int timeouts[12];
 
 int sockmap(struct clientparam * param, int timeo, int usesplice);
 int udpsockmap(struct clientparam * param, int timeo);
+int udpbind(struct clientparam * param);
+int socks5_setaddr(int family, int atyp, const unsigned char *addr, PROXYSOCKADDRTYPE *sa);
+#ifdef __linux__
+int switch_ns(struct srvparam *srv, int target_fd);
+#endif
 int socksend(struct clientparam *param, SOCKET sock, unsigned char * buf, int bufsize, int to);
 int socksendto(struct clientparam *param, SOCKET sock, struct sockaddr * sin, unsigned char * buf, int bufsize, int to);
 int sockrecvfrom(struct clientparam *param, SOCKET sock, struct sockaddr * sin, unsigned char * buf, int bufsize, int to);
@@ -271,7 +309,7 @@ extern int demon;
 unsigned char * mycrypt(const unsigned char *key, const unsigned char *salt, unsigned char *buf);
 unsigned char * ntpwdhash (unsigned char *szHash, const unsigned char *szPassword, int tohex);
 int de64 (const unsigned char *in, unsigned char *out, int maxlen);
-unsigned char* en64 (const unsigned char *in, unsigned char *out, int inlen);
+unsigned char* en64 (const unsigned char *in, unsigned char *out, int inlen, int outsize);
 void tohex(unsigned char *in, unsigned char *out, int len);
 void fromhex(unsigned char *in, unsigned char *out, int len);
 
@@ -317,6 +355,7 @@ int parseusername(char *username, struct clientparam *param, int extpasswd);
 int parseconnusername(char *username, struct clientparam *param, int extpasswd, uint16_t port);
 int ACLmatches(struct ace* acentry, struct clientparam * param);
 int checkACL(struct clientparam * param);
+char * aceaction (int action);
 extern int havelog;
 uint32_t udpresolve(int af, unsigned char * name, unsigned char * value, uint32_t *retttl, struct clientparam* param, int makeauth);
 
@@ -347,6 +386,23 @@ unsigned char * dologname (unsigned char *buf, unsigned char *name, const unsign
 int readconfig(FILE * fp);
 void initcommands(void);
 int connectwithpoll(struct clientparam *param, SOCKET sock, struct sockaddr *sa, SASIZETYPE size, int to);
+int bindwithrange(struct clientparam *param, SOCKET sock, PROXYSOCKADDRTYPE *sa, uint32_t range);
+#ifdef WITH_PCRE
+/* One regular expression implementation for the whole program: the pcre
+   commands and every pattern that carries a pcre: prefix. */
+void * pcre_pattern_compile(const unsigned char *pattern, char *errbuf, int errlen);
+void pcre_pattern_free(void *re);
+int pcre_pattern_match(void *re, const unsigned char *subject, struct capture *caps, int maxcaps);
+#endif
+
+int pushbackcli(struct clientparam * param, const unsigned char * data, int len);
+int parsepattern(struct hostname *h, unsigned char *arg);
+int parsepathpattern(struct hostname *h, unsigned char *arg);
+int patternmatchcaps(const struct hostname *h, const unsigned char *str,
+	struct capture *caps, int *ncaps);
+int patternmatch(const struct hostname *h, const unsigned char *str);
+int patternmatchpos(const struct hostname *h, const unsigned char *str, int *start, int *len);
+void applyportranges(struct clientparam * param, struct ace * acentry);
 
 
 uint32_t myrand(void);
@@ -366,7 +422,18 @@ void * sockschild(struct clientparam * param);
 void * tcppmchild(struct clientparam * param);
 void * autochild(struct clientparam * param);
 void * udppmchild(struct clientparam * param);
-void * adminchild(struct clientparam * param);
+#ifdef WITH_HTTPSRV
+int op_admin(struct httpreq *r, const unsigned char *params);
+int op_admin_counters(struct httpreq *r, const unsigned char *params);
+int op_admin_reload(struct httpreq *r, const unsigned char *params);
+int op_admin_services(struct httpreq *r, const unsigned char *params);
+#endif
+#ifdef WITH_HTTPSRV
+void * httpsrvchild(struct clientparam * param);
+int httpopbyname(const unsigned char *name);
+int httpchunk(struct clientparam *param, const char *buf, int len);
+void freehttprules(struct httprule *rule);
+#endif
 void * ftpprchild(struct clientparam * param);
 void * tlsprchild(struct clientparam * param);
 /* Child functions return the child to redirect the request to, or NULL if

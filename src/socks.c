@@ -7,15 +7,6 @@
 */
 
 #include "proxy.h"
-#ifdef __linux__
-#include <sched.h>
-
-static int switch_ns(struct srvparam *srv, int target_fd) {
-	if(target_fd < 0) return 0;
-	if(srv->saved_nsfd >= 0 && setns(srv->saved_nsfd, CLONE_NEWNET)) return -1;
-	return setns(target_fd, CLONE_NEWNET);
-}
-#endif
 
 #define RETURN(xxx) { param->res = xxx; goto CLEANRET; }
 
@@ -116,38 +107,20 @@ void * sockschild(struct clientparam* param) {
  }
  
  size = 4;
- *SAFAMILY(&param->sinsr) = *SAFAMILY(&param->req) = AF_INET;
  switch(c) {
 #ifndef NOIPV6
 	case 4:
-		if(param->srv->family == 4) RETURN(997);
 		size = 16;
-		*SAFAMILY(&param->sinsr) = *SAFAMILY(&param->req) = AF_INET6;
 #endif
 	case 1:
 		for (i = 0; i<size; i++){
 			if ((res = sockgetcharcli(param, conf.timeouts[SINGLEBYTE_S], 0)) == EOF) {RETURN(441);}
 			buf[i] = (unsigned char)res;
 		}
-#ifndef NOIPV6
-		if (c == 1 && param->srv->family==6){
-			char prefix[] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255};
-			*SAFAMILY(&param->sinsr) = *SAFAMILY(&param->req) = AF_INET6;
-			memcpy(SAADDR(&param->sinsr), prefix, 12);
-			memcpy(12 + (char *)SAADDR(&param->sinsr), buf, 4);
-			memcpy(SAADDR(&param->req), prefix, 12);
-			memcpy(12 + (char *)SAADDR(&param->req), buf, 4);
-		}
-		else {
-#endif
-			memcpy(SAADDR(&param->sinsr), buf, size);
-			memcpy(SAADDR(&param->req), buf, size);
-#ifndef NOIPV6
-		}
-#endif
-		if(command == 1 && SAISNULL(&param->req)) {
-			RETURN(431);
-		}
+		res = socks5_setaddr(param->srv->family, c, buf, &param->req);
+		if(res == 1) {RETURN(997);}
+		if(res == 2 && command == 1) {RETURN(431);}
+		param->sinsr = param->req;
 		myinet_ntop(*SAFAMILY(&param->sinsr), SAADDR(&param->sinsr), (char *)buf, 64);
 		break;
 	case 3:
@@ -219,7 +192,11 @@ void * sockschild(struct clientparam* param) {
 	 RETURN(997);
  }
 
- if((res = (*param->srv->authfunc)(param))) {
+ if(command == 3) param->preauth = 1;
+ res = (*param->srv->authfunc)(param);
+ param->preauth = 0;
+ if(command == 3 && res == 2) res = 0;
+ if(res) {
 	RETURN(res);
  }
 
@@ -238,19 +215,13 @@ void * sockschild(struct clientparam* param) {
 #endif
 
  if(command == 3) {
-#ifdef __linux__
-	if(switch_ns(param->srv, param->srv->o_nsfd)) {RETURN(11);}
-#endif
-	if ((param->remsock=param->srv->so._socket(param->sostate, SASOCK(&param->req), SOCK_DGRAM, IPPROTO_UDP)) == INVALID_SOCKET) {RETURN (11);}
-#ifdef _WIN32
-	{ unsigned long ul = 1; ioctlsocket(param->remsock, FIONBIO, &ul); }
-#else
-	fcntl(param->remsock, F_SETFL, O_NONBLOCK | fcntl(param->remsock, F_GETFL));
-#endif
+	if((res = udpbind(param))) {RETURN(res);}
  }
-
- if(command > 1) {
-	if(param->srv->so._bind(param->sostate, param->remsock,(struct sockaddr *)&param->sinsl,SASIZE(&param->sinsl))) {
+ else if(command == 2) {
+	if(bindwithrange(param, param->remsock, &param->sinsl, param->extport)) {
+		/* a range has already been searched, retrying on any port would
+		   ignore what was asked for */
+		if(param->extport) RETURN (12);
 		*SAPORT(&param->sinsl) = 0;
 		if(param->srv->so._bind(param->sostate, param->remsock,(struct sockaddr *)&param->sinsl,SASIZE(&param->sinsl)))RETURN (12);
 #if SOCKSTRACE > 0
@@ -260,7 +231,8 @@ fflush(stderr);
 	}
 	sasize = SASIZE(&param->sinsl);
 	param->srv->so._getsockname(param->sostate, param->remsock, (struct sockaddr *)&param->sinsl,  &sasize);
-	if(command == 3) {
+ }
+ if(command == 3) {
 		param->ctrlsock = param->clisock;
 #ifdef __linux__
 		if(switch_ns(param->srv, param->srv->i_nsfd)) {RETURN(11);}
@@ -274,7 +246,8 @@ fflush(stderr);
 #endif
 		sin = param->sincl;
 		*SAPORT(&sin) = 0;
-		if(param->srv->so._bind(param->sostate, param->clisock,(struct sockaddr *)&sin,SASIZE(&sin))) {RETURN (12);}
+		/* the port the client is told to send its datagrams to */
+		if(bindwithrange(param, param->clisock, &sin, param->intport)) {RETURN (12);}
 		sasize = SASIZE(&sin);
 		param->srv->so._getsockname(param->sostate, param->clisock, (struct sockaddr *)&sin, &sasize);
 #if SOCKSTRACE > 0
@@ -283,7 +256,6 @@ fprintf(stderr, "%hu binded to communicate with client\n",
 	);
 fflush(stderr);
 #endif
-	}
  }
  param->res = 0;
 
@@ -299,7 +271,7 @@ CLEANRET:
 
 	sasize = sizeof(sin);
 	if(command != 3 && param->remsock != INVALID_SOCKET) param->srv->so._getsockname(param->sostate, param->remsock, (struct sockaddr *)&sin,  &sasize);
-	if(!SAISNULL(&param->srv->extNat)){
+	if(command != 3 && !SAISNULL(&param->srv->extNat)){
 	    uint16_t port;
 	    port = *SAPORT(&sin);
 	    sin = param->srv->extNat;
@@ -307,7 +279,7 @@ CLEANRET:
 	}
 	else {
 	    param->srv->so._getsockname(param->sostate, param->clisock, (struct sockaddr *)&sin,  &sasize);
-	    if(!SAISNULL(&param->srv->intNat)){
+	    if(command == 3 && !SAISNULL(&param->srv->intNat)){
 		uint16_t port;
 		port = *SAPORT(&sin);
 		sin = param->srv->intNat;

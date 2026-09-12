@@ -265,6 +265,9 @@ static FILTER_ACTION pcre_filter_client(void *fo, struct clientparam * param, vo
 	return (res)? CONTINUE:PASS;
 }
 
+/* What a rewritten buffer keeps free for its caller to append to. */
+#define PCRE_HEADROOM 1024
+
 static FILTER_ACTION pcre_filter_buffer(void *fc, struct clientparam *param, unsigned char ** buf_p, int * bufsize_p, int offset, int * length_p){
 	PCRE2_SIZE *ovector;
 	int count = 0;
@@ -277,7 +280,7 @@ static FILTER_ACTION pcre_filter_buffer(void *fc, struct clientparam *param, uns
 #define pcrefd ((struct pcre_filter_data *)fc)
 
 	for(acl = pcrefd->acl; acl; acl=acl->next){
-		if(pl->ACLMatches(pcrefd->acl, param)){
+		if(pl->ACLMatches(acl, param)){
 			match = 1;
 			break;
 		}
@@ -324,12 +327,17 @@ static FILTER_ACTION pcre_filter_buffer(void *fc, struct clientparam *param, uns
 			else if(*replace == '$' && isnumber(*(replace+1))){
 				replace ++;
 				num = atoi(replace);
+				/* Past the digits first, and only then decide whether
+				   the group is one to copy: the pass which measured
+				   this string did it in that order, and a reference it
+				   counted as nothing must not be written out as its
+				   own digits here. */
+				while(isnumber(*replace)) replace++;
 				if(num > (count - 1)) continue;
 				if(ovector[(num<<1)] == PCRE2_UNSET) continue;
 				if(ovector[(num<<1) + 1] > (PCRE2_SIZE)*length_p || ovector[(num<<1)] > ovector[(num<<1) + 1]) continue;
 				memcpy(target, *buf_p + ovector[(num<<1)], ovector[(num<<1) + 1] - ovector[(num<<1)]);
 				target += (ovector[(num<<1) + 1] - ovector[(num<<1)]);
-				while(isnumber(*replace)) replace++;
 			}
 			else {
 				*target++ = *replace++;
@@ -338,7 +346,13 @@ static FILTER_ACTION pcre_filter_buffer(void *fc, struct clientparam *param, uns
 		repsz = (int)(target - tmpbuf);
 		memcpy(target, *buf_p + ovector[1], *length_p - ovector[1]);
 		if((ovector[0] + replen + 1) > *bufsize_p){
-			newbuf = pl->mallocfunc(ovector[0] + replen + 1);
+			/* Room beyond what was produced: whoever asked for the
+			   filtering usually has something of its own to add, and a
+			   buffer sized to the last byte written leaves nowhere to
+			   put it. The size reported is the size allocated. */
+			int newsize = ovector[0] + replen + 1 + PCRE_HEADROOM;
+
+			newbuf = pl->mallocfunc(newsize);
 			if(!newbuf){
 				pl->freefunc(tmpbuf);
 				return CONTINUE;
@@ -346,7 +360,7 @@ static FILTER_ACTION pcre_filter_buffer(void *fc, struct clientparam *param, uns
 			memcpy(newbuf, *buf_p, ovector[0]);
 			pl->freefunc(*buf_p);
 			*buf_p = (unsigned char *)newbuf;
-			*bufsize_p = ovector[0] + replen + 1;
+			*bufsize_p = newsize;
 		}
 		memcpy(*buf_p + ovector[0], tmpbuf, replen);
 		pl->freefunc(tmpbuf);
@@ -628,6 +642,71 @@ static struct symbol regexp_symbols[] = {
 	{NULL, "pcre_options", (void *)&pcre_options},
 };
 
+
+/* Compiling and matching for patterns outside the pcre commands: a host name
+   or a URL in an http rule, an access rule naming a host. They go through the
+   same compile, with whatever pcre_options is set to, so one kind of regular
+   expression is understood everywhere.
+ */
+void * pcre_pattern_compile(const unsigned char *pattern, char *errbuf, int errlen)
+{
+	pcre2_code *re;
+	int errcode;
+	PCRE2_SIZE erroffset;
+
+	re = pcre2_compile((PCRE2_SPTR)pattern, PCRE2_ZERO_TERMINATED, pcre_options,
+		&errcode, &erroffset, NULL);
+	if(!re){
+		if(errbuf && errlen > 0){
+			PCRE2_UCHAR message[256];
+
+			pcre2_get_error_message(errcode, message, sizeof(message));
+			snprintf(errbuf, errlen, "%s at offset %d", (char *)message, (int)erroffset);
+		}
+		return NULL;
+	}
+	return re;
+}
+
+void pcre_pattern_free(void *re)
+{
+	if(re) pcre2_code_free((pcre2_code *)re);
+}
+
+/* Returns the number of captures placed, or 0 when the subject does not
+   match. Element 0 is the whole match. The match data is per call: a rule is
+   matched from several threads at once.
+ */
+int pcre_pattern_match(void *re, const unsigned char *subject, struct capture *caps, int maxcaps)
+{
+	pcre2_match_data *match_data;
+	PCRE2_SIZE *ovector;
+	int count, i, placed = 0;
+
+	if(!re || !subject) return 0;
+	match_data = pcre2_match_data_create_from_pattern((pcre2_code *)re, NULL);
+	if(!match_data) return 0;
+
+	count = pcre2_match((pcre2_code *)re, (PCRE2_SPTR)subject, PCRE2_ZERO_TERMINATED,
+		0, 0, match_data, NULL);
+	if(count > 0){
+		ovector = pcre2_get_ovector_pointer(match_data);
+		if(count > maxcaps) count = maxcaps;
+		for(i = 0; i < count; i++){
+			if(ovector[i*2] == PCRE2_UNSET){
+				caps[i].start = 0;
+				caps[i].len = 0;
+			}
+			else {
+				caps[i].start = (int)ovector[i*2];
+				caps[i].len = (int)(ovector[i*2+1] - ovector[i*2]);
+			}
+		}
+		placed = count;
+	}
+	pcre2_match_data_free(match_data);
+	return placed;
+}
 
 void pcre_install(void){
 

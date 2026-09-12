@@ -132,6 +132,12 @@ char * proxy_stringtable[] = {
 };
 
 #define LINESIZE 32768
+/* "Content-Length: " plus 20 digits plus CRLF and a NUL, rounded up */
+#define CLHDRSIZE 48
+/* what the headers this proxy adds of its own can come to: a Forwarded or
+   Via with a host name in it, a Connection, a Proxy-support and a
+   Proxy-Authorization carrying an encoded user and password */
+#define HDRRESERVE 2048
 #define BUFSIZE (LINESIZE*2)
 #define FTPBUFSIZE 1536
 
@@ -151,10 +157,44 @@ static int send_st(struct clientparam *param, int idx){
 	return socksend(param, param->clisock, (unsigned char *)proxy_stringtable[idx], pst_len(idx), conf.timeouts[STRING_S]);
 }
 
+/* Makes room in a buffer whose size is tracked. A filter may hand back one
+   holding exactly what it produced, so nothing may be added to it without
+   asking for the room first. Returns 1 when the room cannot be had. */
+static int growbuf(unsigned char **buf, int *bufsize, int need){
+	unsigned char *newbuf;
+
+	if(need <= *bufsize) return 0;
+	need += BUFSIZE;		/* for what follows too, not just this */
+	if(!(newbuf = realloc(*buf, need))) return 1;
+	*buf = newbuf;
+	*bufsize = need;
+	return 0;
+}
+
 static void freeptr(void *p){
 	void **pp = (void **)p;
 	if(*pp) { free(*pp); *pp = NULL; }
 }
+
+#ifndef WITHMAIN
+/* Point at the path in a request line and report the authority it names.
+   Returns NULL if the line is not one we can put back together. */
+static unsigned char * reqpath(unsigned char *line, unsigned char **host, int *hostlen)
+{
+	unsigned char *sp, *p;
+
+	*host = NULL;
+	*hostlen = 0;
+	if(!line || !(sp = (unsigned char *)strchr((char *)line, ' '))) return NULL;
+	while(*sp == ' ') sp++;
+	if(*sp == '/') return sp;
+	if(strncasecmp((char *)sp, "http://", 7)) return NULL;
+	*host = p = sp + 7;
+	while(*p && *p != '/' && *p != ' ') p++;
+	*hostlen = (int)(p - *host);
+	return (*p == '/')? p : NULL;
+}
+#endif
 
 static void logurl(struct clientparam * param, char * buf, char * req, int ftp){
  char *sb;
@@ -247,12 +287,14 @@ void * proxychild(struct clientparam* param) {
  int redirect = 0;
  int prefix = 0, ckeepalive=0;
  int ftp = 0;
+ int ssoff = 0;
 #ifndef ANONYMOUS
  int anonymous;
 #endif
  int sleeptime = 0;
 #ifndef WITHMAIN
  int reqsize, reqbufsize;
+ unsigned char *origreq = NULL;
 #endif
  int authenticate;
  struct pollfd fds[2];
@@ -338,6 +380,7 @@ for(;;){
 
  if ((sb=(unsigned char *)(unsigned char *)strchr((char *)buf, ' ')) == NULL) {RETURN(512);}
  ss = ++sb;
+ ssoff = (int)(ss - buf);
  if(!isconnect) {
 	if (!strncasecmp((char *)sb, "http://", 7)) {
 		sb += 7;
@@ -575,16 +618,60 @@ for(;;){
 
 #ifndef WITHMAIN
 
+ /* Only worth keeping a copy when something can rewrite it. */
+ if(param->nreqfilters) origreq = (unsigned char *)strdup((char *)req);
  action = handlereqfilters(param, &req, &reqbufsize, 0, &reqsize);
  if(action == HANDLED){
+	freeptr(&origreq);
 	RETURN(0);
  }
- if(action != PASS) RETURN(517);
+ if(action != PASS){
+	freeptr(&origreq);
+	RETURN(517);
+ }
+
+ /* Only the copy in req was rewritten. On a direct connection the server is
+    sent the request line held in buf, which was parsed and reduced to its
+    path before the filters ran, so put the new path there as well.
+
+    The destination was chosen, and the access rules applied to it, before
+    the rewrite happened. A rewrite that changes the method or the authority
+    is therefore left alone: acting on it would send the request somewhere
+    the rules never saw. */
+ if(origreq && !isconnect && !ftp && strcmp((char *)req, (char *)origreq)){
+	unsigned char *oldhost, *newhost, *oldpath, *newpath;
+	int oldhostlen, newhostlen, methodlen;
+
+	methodlen = (int)(strchr((char *)origreq, ' ') - (char *)origreq);
+	oldpath = reqpath(origreq, &oldhost, &oldhostlen);
+	newpath = reqpath(req, &newhost, &newhostlen);
+	if(oldpath && newpath
+	   && methodlen > 0 && !strncmp((char *)req, (char *)origreq, methodlen)
+	   && req[methodlen] == ' '
+	   && oldhostlen == newhostlen
+	   && (!oldhostlen || !strncasecmp((char *)oldhost, (char *)newhost, oldhostlen))){
+		int newlen = (int)strlen((char *)newpath);
+		int delta = newlen - ((int)reqlen - ssoff);
+
+		if(ssoff > 0 && (int)reqlen >= ssoff && inbuf + delta < bufsize - 1){
+			memmove(buf + ssoff + newlen, buf + reqlen, inbuf - reqlen + 1);
+			memcpy(buf + ssoff, newpath, newlen);
+			inbuf += delta;
+			reqlen += delta;
+			buf[inbuf] = 0;
+		}
+	}
+ }
+ freeptr(&origreq);
  action = handlehdrfilterscli(param, &buf, &bufsize, 0, &inbuf);
  if(action == HANDLED){
 	RETURN(0);
  }
  if(action != PASS) RETURN(517);
+ /* A filter may have returned a buffer sized to exactly what it produced.
+    The headers this proxy adds of its own go in after it, so the room for
+    them is taken back before anything is written. */
+ if(growbuf(&buf, &bufsize, inbuf + HDRRESERVE)) RETURN(21);
  param->nolongdatfilter = 0;
 
 #endif
@@ -618,6 +705,7 @@ for(;;){
 	contentlength64 = param->cliinbuf;
 	param->nolongdatfilter = 1;
   }
+  if(growbuf(&buf, &bufsize, (int)strlen((char *)buf) + CLHDRSIZE)) RETURN(21);
   sprintf((char*)buf+strlen((char *)buf), "Content-Length: %"PRIu64"\r\n", contentlength64);
  }
 
@@ -640,6 +728,7 @@ for(;;){
 	ckeepalive = 1;
 	if(ftpbase) free(ftpbase);
 	ftpbase = NULL;
+	ss = buf + ssoff;
 	if(!(sp = (unsigned char *)strchr((char *)ss, ' '))){RETURN(799);}
 	*sp = 0;
 
@@ -828,12 +917,20 @@ for(;;){
 						send_st(param, 9);
 					}
 					if((unsigned)socksend(param, param->clisock, buf, inbuf, conf.timeouts[STRING_S]) != inbuf){
+						param->srv->so._closesocket(param->sostate, ftps);
+						ftps = INVALID_SOCKET;
+						param->remsock = s;
 						RETURN(781);
 					}
 					inbuf = 0;
 				}
 				else {
-					if(!(newbuf = realloc(buf, bufsize + BUFSIZE))){RETURN (21);}
+					if(!(newbuf = realloc(buf, bufsize + BUFSIZE))){
+						param->srv->so._closesocket(param->sostate, ftps);
+						ftps = INVALID_SOCKET;
+						param->remsock = s;
+						RETURN (21);
+					}
 					buf = newbuf;
 					bufsize += BUFSIZE;
 				}
@@ -926,7 +1023,8 @@ for(;;){
  if(param->extusername){
 	hlen += sprintf((char*)buf + hlen, "%s: Basic ", (redirect)?"Proxy-Authorization":"Authorization");
 	sprintf((char*)username, "%.128s:%.128s", param->extusername, param->extpassword?param->extpassword:(unsigned char*)"");
-	hlen = (int)(en64(username, buf + hlen, (int)strlen((char *)username)) - buf);
+	if(!(sb = en64(username, buf + hlen, (int)strlen((char *)username), bufsize - hlen))) {RETURN(21);}
+	hlen = (int)(sb - buf);
 	hlen += sprintf((char*)buf + hlen, "\r\n");
  }
  hlen += sprintf((char*)buf + hlen, "\r\n");
@@ -1085,6 +1183,7 @@ for(;;){
 	RETURN(0);
  }
  if(action != PASS) RETURN(517);
+ if(growbuf(&buf, &bufsize, inbuf + HDRRESERVE)) RETURN(21);
 
  param->nolongdatfilter = 0;
 
@@ -1108,6 +1207,7 @@ for(;;){
 	}
 	if(action != PASS) RETURN(517);
 	contentlength64 = param->srvinbuf;
+	if(growbuf(&buf, &bufsize, (int)strlen((char *)buf) + CLHDRSIZE)) RETURN(21);
 	sprintf((char*)buf+strlen((char *)buf), "Content-Length: %"PRIu64"\r\n", contentlength64);
 	hascontent = 1;
   }
@@ -1198,6 +1298,16 @@ REQUESTEND:
 	RETURN(0);
  }
  if(param->transparent && (!ckeepalive || !keepalive)) {RETURN (0);}
+ /* Another service read this request and handed it here to be answered. It
+    keeps the connection and decides what the next request on it is, so this
+    one is done. Whatever was opened towards the server stays open in param
+    for the next one. */
+ if(param->onerequest){
+	/* 2 says the client connection may carry another request, 1 that it may
+	   not, which is what the service holding it needs to know. */
+	param->onerequest = (ckeepalive && keepalive)? 2 : 1;
+	RETURN(0);
+ }
  logurl(param, (char *)buf, (char *)req, ftp);
  param->status = 0;
 

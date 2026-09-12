@@ -9,6 +9,48 @@
 
 
 #include "proxy.h"
+/* returns 0 on success, 1 if atyp is not supported for family, 2 if the
+   address is null. The address is set in both the 0 and the 2 case. */
+int socks5_setaddr(int family, int atyp, const unsigned char *addr, PROXYSOCKADDRTYPE *sa){
+	int i, len = 4;
+
+	memset(sa, 0, sizeof(*sa));
+	if(atyp == 4){
+#ifdef NOIPV6
+		return 1;
+#else
+		if(family == 4) return 1;
+		len = 16;
+		*SAFAMILY(sa) = AF_INET6;
+		memcpy(SAADDR(sa), addr, 16);
+#endif
+	}
+#ifndef NOIPV6
+	else if(family == 6){
+		unsigned char prefix[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255};
+
+		*SAFAMILY(sa) = AF_INET6;
+		memcpy(SAADDR(sa), prefix, 12);
+		memcpy(12 + (unsigned char *)SAADDR(sa), addr, 4);
+	}
+#endif
+	else {
+		*SAFAMILY(sa) = AF_INET;
+		memcpy(SAADDR(sa), addr, 4);
+	}
+	for(i = 0; i < len && !addr[i]; i++);
+	return (i == len)? 2 : 0;
+}
+
+#ifdef __linux__
+#include <sched.h>
+
+int switch_ns(struct srvparam *srv, int target_fd) {
+	if(target_fd < 0) return 0;
+	if(srv->saved_nsfd >= 0 && setns(srv->saved_nsfd, CLONE_NEWNET)) return -1;
+	return setns(target_fd, CLONE_NEWNET);
+}
+#endif
 
 
 char * copyright = COPYRIGHT;
@@ -130,7 +172,7 @@ int timeouts[12] = {
 	60,   /* CHAIN_TO */
 	15,   /* CONNECT_TO */
 	5,    /* CONNBACK_TO */
-	0,
+	5,    /* LINGER_TO */
 	0
 };
 
@@ -140,7 +182,7 @@ int timeouts[12] = {
    EINVAL below it and the thread silently gets the 8M system default stack.
  */
 size_t threadstacksize(int extra){
-	long size = BASESTACKSIZE + extra;
+	long size = BASESTACKSIZE + TLSSTACKSIZE + extra;
 
 	if(size < (long)PTHREAD_STACK_MIN) size = (long)PTHREAD_STACK_MIN;
 	return (size_t)size;
@@ -644,13 +686,14 @@ int doconnect(struct clientparam * param){
 
  if (param->operation == ADMIN || (( param->operation == DNSRESOLVE || param->operation == BIND || param->operation == UDPASSOC) && !param->redirected))
 	return 0;
+ if (param->operation == UDPASSOC && param->ctrlsocksrv != INVALID_SOCKET) return 0;
  if (param->remsock != INVALID_SOCKET){
 	if(param->operation == UDPASSOC) return 0;
 	size = sizeof(param->sinsr);
 	if(param->srv->so._getpeername(param->sostate, param->remsock, (struct sockaddr *)&param->sinsr, &size)==-1) {return (14);}
  }
  else {
-	struct linger lg = {1,conf.timeouts[SINGLEBYTE_S]};
+	struct linger lg = {1,conf.timeouts[LINGER_TO]};
 
 	if(SAISNULL(&param->sinsr)){
 		if(SAISNULL(&param->req)) {
@@ -703,7 +746,7 @@ int doconnect(struct clientparam * param){
 #ifdef WITH_UN
 	if(*SAFAMILY(&param->sinsl) != AF_UNIX)
 #endif
-	if(param->srv->so._bind(param->sostate, param->remsock, (struct sockaddr*)&param->sinsl, SASIZE(&param->sinsl))==-1) {
+	if(bindwithrange(param, param->remsock, &param->sinsl, param->extport)==-1) {
 		return 12;
 	}
 	
@@ -722,6 +765,49 @@ int doconnect(struct clientparam * param){
     if(action != PASS) return 19;
  }
  return 0;
+}
+
+/* Number of ports tried before giving up when the range has to be searched by
+ * hand. The kernel option picks a free port itself and needs no retries. */
+#define RANGETRIES 10
+
+/* Bind sock to sa, taking the local port from the range if one is set. The
+ * range is packed as first | last << 16.
+ *
+ * IP_LOCAL_PORT_RANGE leaves the choice to the kernel, which knows which ports
+ * are free. Where the option does not exist, or the kernel refuses it, or the
+ * address family is not one it covers, pick a port at random instead and retry
+ * on failure, since the one picked may already be taken.
+ */
+int bindwithrange(struct clientparam *param, SOCKET sock, PROXYSOCKADDRTYPE *sa, uint32_t range)
+{
+	uint16_t first, last;
+	int i;
+
+	if(!range) return param->srv->so._bind(param->sostate, sock, (struct sockaddr *)sa, SASIZE(sa));
+
+#ifdef IP_LOCAL_PORT_RANGE
+	if(*SAFAMILY(sa) == AF_INET &&
+	   !param->srv->so._setsockopt(param->sostate, sock, IPPROTO_IP, IP_LOCAL_PORT_RANGE,
+		(char *)&range, sizeof(range))){
+		*SAPORT(sa) = 0;
+		return param->srv->so._bind(param->sostate, sock, (struct sockaddr *)sa, SASIZE(sa));
+	}
+#endif
+
+	first = (uint16_t)(range & 0xffff);
+	last = (uint16_t)(range >> 16);
+
+	for(i = 0; i < RANGETRIES; i++){
+		*SAPORT(sa) = htons((uint16_t)(first + (myrand() % (unsigned)(last - first + 1))));
+		if(!param->srv->so._bind(param->sostate, sock, (struct sockaddr *)sa, SASIZE(sa))) return 0;
+	}
+
+	/* Every port tried was taken. Fall back to an ephemeral one, which is
+	   what the kernel option above does when it cannot honour the range, so
+	   an exhausted range behaves the same way on every platform. */
+	*SAPORT(sa) = 0;
+	return param->srv->so._bind(param->sostate, sock, (struct sockaddr *)sa, SASIZE(sa));
 }
 
 int scanaddr(const unsigned char *s, uint32_t * ip, uint32_t * mask) {

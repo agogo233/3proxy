@@ -11,6 +11,9 @@ CRYPT_PREFIX ?= $(PREFIX)
 CC ?= gcc
 CFLAGS ?= -O3 -flto
 CFLAGS += -fno-strict-aliasing -c -mthreads  -DWITH_WSAPOLL -DWITH_ODBC
+# Windows does not take a recv and a send on one socket from two threads,
+# so a UDP service answers from a socket of its own
+CFLAGS += -DNO_SHARE_UDP_SOCKET
 COUT = -o 
 LN ?= $(CC)
 LDFLAGS ?= -O3 -flto
@@ -20,9 +23,14 @@ LDFLAGS += -fno-strict-aliasing -mthreads
 # makefile, including the += above and the STATIC/LIBSTATIC handling below.
 CFLAGS += $(EXTRA_CFLAGS)
 LDFLAGS += $(EXTRA_LDFLAGS)
+HTTPSRV ?= true
+ifeq ($(HTTPSRV),true)
+    CFLAGS += -DWITH_HTTPSRV
+    HTTPSRV_OBJS = srvhttpsrv$(OBJSUFFICS) srvwebadmin$(OBJSUFFICS)
+endif
 DLFLAGS ?= -shared
 DLSUFFICS = .dll
-LIBS += -lws2_32 -lodbc32 -ladvapi32 -luser32 -lbcrypt
+LIBS += -lws2_32 -lmswsock -lodbc32 -ladvapi32 -luser32 -lbcrypt
 LIBSPREFIX = -l
 LIBSSUFFIX =
 LNOUT = -o 
@@ -47,14 +55,14 @@ ifeq ($(LIBSTATIC), true)
     STATIC_SUFFIX = -Wl,-Bdynamic
     ZLIB = -lz
 endif
-WOLFSSL_CHECK = $(shell echo "\#include <wolfssl/options.h>\\n\#include <wolfssl/openssl/ssl.h>\\n int main(){return 0;}" | tr -d '\\\\' | $(CC) -x c $(CFLAGS) $(LDFLAGS) $(STATIC_PREFIX) -lwolfssl $(STATIC_SUFFIX) -o testwssl - 2>/dev/null && rm testwssl && echo true||echo false)
+WOLFSSL_CHECK = $(shell printf "\#include <wolfssl/options.h>\\n\#include <wolfssl/openssl/ssl.h>\\n int main(){return 0;}" | tr -d '\\\\' | $(CC) -x c $(CFLAGS) $(LDFLAGS) $(STATIC_PREFIX) -lwolfssl $(STATIC_SUFFIX) -o testwssl - 2>/dev/null && rm testwssl && echo true||echo false)
 ifeq ($(WOLFSSL_CHECK), true)
     LIBS += $(STATIC_PREFIX) -lwolfssl $(STATIC_SUFFIX) -lws2_32
     CFLAGS += -DWITH_SSL -DWITH_WOLFSSL
     SSL_OBJS = ssllib$(OBJSUFFICS) ssl$(OBJSUFFICS)
     ZLIB :=
 else
-OPENSSL_CHECK = $(shell echo "\#include <openssl/ssl.h>\\n int main(){return 0;}" | tr -d '\\\\' | $(CC) -x c $(CFLAGS) $(LDFLAGS) $(STATIC_PREFIX) $(ZLIB) -l crypto -l ssl $(STATIC_SUFFIX) -o testssl - 2>/dev/null && rm testssl && echo true||echo false)
+OPENSSL_CHECK = $(shell printf "\#include <openssl/ssl.h>\\n int main(){return 0;}" | tr -d '\\\\' | $(CC) -x c $(CFLAGS) $(LDFLAGS) $(STATIC_PREFIX) $(ZLIB) -l crypto -l ssl $(STATIC_SUFFIX) -o testssl - 2>/dev/null && rm testssl && echo true||echo false)
 ifeq ($(OPENSSL_CHECK), true)
     LIBS += $(STATIC_PREFIX) $(ZLIB) -l crypto -l ssl $(STATIC_SUFFIX) -lcrypt32
     CFLAGS += -DWITH_SSL
@@ -63,11 +71,11 @@ else
     ZLIB :=
 endif
 endif
-PAM_CHECK = $(shell echo "\#include <security/pam_appl.h>\\n int main(){return 0;}" | tr -d '\\\\' | $(CC) -x c $(CFLAGS) $(LDFLAGS) -l pam -o testpam - 2>/dev/null && rm testpam && echo true||echo false)
+PAM_CHECK = $(shell printf "\#include <security/pam_appl.h>\\n int main(){return 0;}" | tr -d '\\\\' | $(CC) -x c $(CFLAGS) $(LDFLAGS) -l pam -o testpam - 2>/dev/null && rm testpam && echo true||echo false)
 ifeq ($(PAM_CHECK), true)
     PLUGINS += PamAuth
 endif
-PCRE_CHECK = $(shell echo "\#define PCRE2_CODE_UNIT_WIDTH 8\\n#include <pcre2.h>\\n int main(){return 0;}" | tr -d '\\\\' | $(CC) -x c $(CFLAGS) $(LDFLAGS) $(STATIC_PREFIX) -lpcre2-8 $(STATIC_SUFFIX) -o testpcre - 2>/dev/null && rm testpcre && echo true||echo false)
+PCRE_CHECK = $(shell printf "\#define PCRE2_CODE_UNIT_WIDTH 8\\n#include <pcre2.h>\\n int main(){return 0;}" | tr -d '\\\\' | $(CC) -x c $(CFLAGS) $(LDFLAGS) $(STATIC_PREFIX) -lpcre2-8 $(STATIC_SUFFIX) -o testpcre - 2>/dev/null && rm testpcre && echo true||echo false)
 ifeq ($(PCRE_CHECK), true)
     CFLAGS += -DWITH_PCRE
     PCRE_OBJS = pcre$(OBJSUFFICS)

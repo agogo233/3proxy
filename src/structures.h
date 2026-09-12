@@ -216,6 +216,7 @@ typedef enum {
 	S_AUTO,
 	S_TLSPR,
 	S_IMAPP,
+	S_HTTPSRV,
 	S_ZOMBIE
 }PROXYSERVICE;
 
@@ -313,7 +314,9 @@ typedef enum {
 	R_TLS,
 	R_HA,
 	R_DNS,
-	R_IMAP
+	R_IMAP,
+	R_EXTPORT,
+	R_INTPORT
 } REDIRTYPE;
 
 struct redirdesc {
@@ -335,6 +338,8 @@ struct chain {
 	unsigned char * extpass;
 	unsigned short weight;
 	unsigned short cidr;
+	/* local port range for extport/intport, first in the low half */
+	uint32_t range;
 };
 
 struct period {
@@ -345,11 +350,71 @@ struct period {
 
 #define MATCHBEGIN 1
 #define MATCHEND 2
+/* A pattern is either the star form above, matched by matchtype, or a regular
+   expression compiled once when the configuration is read. */
+#define MATCHGLOB  4	/* stars anywhere: * within a path element, ** across */
+#define MATCHREGEX 5
+
+/* What a star or a capturing group stood for. Element 0 is the whole
+   subject, so a template writes it as $0 and the groups as $1 upwards. */
+#define MAXCAPTURES 10
+struct capture {
+	int start;
+	int len;
+};
 
 struct hostname {
 	struct hostname *next;
 	unsigned char * name;
 	int matchtype;
+	void * re;		/* compiled regular expression, MATCHREGEX only */
+};
+
+/* A request handed to an http operation. */
+struct httpreq {
+	struct capture caps[MAXCAPTURES];
+	int ncaps;
+	struct capture hostcaps[MAXCAPTURES];
+	int nhostcaps;
+	const char *ctype;
+	const char *hdrs;
+	int maxage;
+	int code;
+	time_t ims;		/* what If-Modified-Since asked about, or 0 */
+	int version;		/* 0 for HTTP/1.0, 1 for HTTP/1.1 */
+	int keepalive;		/* whether the connection carries another request */
+	int first;		/* the first request on this connection */
+	int chunkedreq;		/* a body this server does not know how to read */
+	int proxy;		/* the client asked the way it asks a proxy */
+	int connect;		/* and asked for a tunnel */
+	int mayproxy;		/* an access rule sent this to the local proxy */
+	unsigned char *raw;	/* the request as it arrived, for handing on */
+	int rawlen, rawsize;
+	int drained;		/* the body has been read and thrown away */
+	char *lasthost;		/* where the last request on this connection went */
+	void *handoff;		/* a child which takes the connection over */
+	struct clientparam *param;
+	char method[16];
+	char path[256];
+	char query[512];
+	char host[256];
+	uint64_t contentlen;
+	int globstart, globlen;
+};
+
+/* One "http" line: which host and url it answers for, which operation serves
+   it and the parameters that operation takes. Patterns use the same syntax and
+   the same matcher as host lists in access rules. */
+struct httprule {
+	struct httprule *next;
+	struct hostname host;
+	struct hostname url;
+	int op;
+	unsigned char *params;
+	unsigned char *ctype;	/* type named by the rule, or NULL to work it out */
+	unsigned char *hdrs;	/* headers the rule adds, already CRLF separated */
+	int maxage;		/* seconds to allow caching for, or -1 to say nothing */
+	int code;		/* status the rule answers with, or 0 for the usual */
 };
 
 struct ace {
@@ -551,6 +616,8 @@ struct srvparam {
 #ifdef WITHSPLICE
 	int usesplice;
 #endif
+	int halfclose;
+	int udpauth;
 	unsigned bufsize;
 	unsigned authcachetype, authcachetime;
 	unsigned logdumpsrv, logdumpcli;
@@ -577,6 +644,9 @@ struct srvparam {
 	struct auth *authenticate;
 	struct pollfd * srvfds;
 	struct ace *acl;
+#ifdef WITH_HTTPSRV
+	struct httprule *httprules;
+#endif
 	struct auth *authfuncs;
 	struct filter *filter;
 	unsigned char * logformat;
@@ -643,7 +713,9 @@ struct clientparam {
 		paused,
 		version,
 		connlim,
-		predatdone;
+		predatdone,
+		preauth,
+		dstindep;
 
 	unsigned char 	*hostname,
 			*username,
@@ -665,6 +737,7 @@ struct clientparam {
 			maxtrafout64;
 	PROXYSOCKADDRTYPE sincl, sincr;
 	PROXYSOCKADDRTYPE	sinsl, sinsr, req;
+	uint32_t	extport, intport;
 
 	uint64_t	statscli64,
 			statssrv64;
@@ -678,7 +751,14 @@ struct clientparam {
 
 	PROXYSOCKADDRTYPE udp_relay[3];
 	int udp_nhops;
+	struct ace *lastace;
 	time_t time_start;
+	/* Set by a service which read a request itself and handed it to another
+	   child to answer: that child answers this one request and returns,
+	   leaving the connection to the service which called it. Added last so
+	   that a plugin built against an older header still finds the fields it
+	   knows where they were. */
+	int onerequest;
 };
 
 struct filemon {
@@ -692,6 +772,9 @@ struct extparam {
 	_3proxy_sem_t threadinit;
 	int *timeouts;
 	struct ace * acl;
+#ifdef WITH_HTTPSRV
+	struct httprule *httprules;
+#endif
 	char * conffile;
 	struct bandlim * bandlimiter,  *bandlimiterout;
 	struct connlim * connlimiter;
@@ -832,7 +915,7 @@ struct pluginlink {
 	int (*ACLMatches)(struct ace* acentry, struct clientparam * param);
 	int (*alwaysauth)(struct clientparam * param);
 	int (*checkACL)(struct clientparam * param);
-	unsigned char* (*en64)(const unsigned char *in, unsigned char *out, int inlen);
+	unsigned char* (*en64)(const unsigned char *in, unsigned char *out, int inlen, int outsize);
 	int (*de64)(const unsigned char *in, unsigned char *out, int maxlen);
 	void (*tohex)(unsigned char *in, unsigned char *out, int len);
 	void (*fromhex)(unsigned char *in, unsigned char *out, int len);
@@ -882,7 +965,8 @@ typedef enum {
 	DNS_TO,
 	CHAIN_TO,
 	CONNECT_TO,
-	CONNBACK_TO
+	CONNBACK_TO,
+	LINGER_TO
 }TIMEOUT;
 
 typedef enum {

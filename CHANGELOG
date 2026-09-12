@@ -1,25 +1,13 @@
-3proxy-0.9.7 Released July, 4 2026
+3proxy-1.0.0 Released August, 22 2026
 
-+ PCRE2 and SSL/TLS code moved from plugins into main 3proxy binary; dynamic linking with ssl/pcre by default, STATIC/LIBSTATIC options for static linking
-+ Unix sockets support for parent proxies, tcppm, internal listeners and -i option; abstract (fileless) unix sockets on Linux
-+ ssl_client_mode = 3 to use 'secure' parent types: https, tcps, socks5s, connect+s, etc.
-+ New authcache types: cacheacl, dstaddr, dstport, dsthost, dstoper, srvaddr, srvport; authcache is now configurable per service
-+ Hashtables for password lists and authcache, faster password lookups
-+ 3proxy_crypt: new internal password hashing replacing mycrypt
-+ udppm switched to hashtables and supports multiple connections
-+ SOCKSv5 UDP parent support; -Ne/-Ni NAT options
-+ Docker images for more platforms, signed; DLLs signed; public cert added to build
-+ Grace sleep and linger on connection close; correctly process half-closed connections
-+ Allow setting internal/external network namespaces on Linux
-- icqpr/OSCAR code removed
-! Fix: invalid error in SSL server handshake could break service state
-! Fix: invalid offset in datafilters
-! Fix: invalid socket in poll() could break sockmap() on Windows
-! Fix: deadlock in ftppr
-! Fix: crash on standalone services
-! Fix: non-initialized mutex crash under Windows
-! Fix: socks v5 parent with no auth
-! Fix: hanging connections in sockmap; unneeded poll in sockmap
-! Fix: symbols collision with OpenSSL could lead to crash
-! Fix: compatibility with older SSL versions and older Windows (7 and below)
-! Multiple minor bugfixes and code cleanup
+No changes in 3proxy code, this release only changes how packages are built, signed and published.
+
+! Fix: TLS, PCRE2 and PAM support was silently left out when 3proxy was built on a system whose /bin/sh is not dash, which is every RPM based distribution and macOS; the library checks built their test program with echo and escape sequences, which only dash expands, so every check failed and the features were dropped without a diagnostic
+! Fix: rpm packages were built on Ubuntu and required glibc 2.38, libssl.so.3 and libpcre2-8, which no RPM based distribution provides, so they could not be installed anywhere; they are built against AlmaLinux 8, 9 and 10 now and carry an el8, el9 or el10 tag, covering RHEL, AlmaLinux, Rocky and CentOS Stream of the same version
+! Fix: the rpm package depended on its own interpreter, /bin/3proxy, taken from the first line of the installed configuration file, and could not be installed on el9 or el10 because rpm resolves that dependency to /usr/bin/3proxy
+! Fix: deb packages required glibc 2.38 and libssl3t64 and installed on Ubuntu 24.04 and newer only; they are built against Ubuntu 22.04 now and install on Ubuntu 22.04 and later as well as Debian 12 and later
++ Signed apt and dnf repositories are published at https://3proxy.org/repo/ in two channels: current, built from the master branch, and lts, built from the 0.9 branch; packages and repository metadata are both signed
++ Release binaries are published with SHA256 checksums, an OpenPGP signature and a GitHub build provenance attestation; docker images are signed and attested as well
++ The release signing key is an RSA-4096 key published as 3proxy-release-key.asc in the repository; rpm 4.14 and earlier can not import an Ed25519 key at all, which would leave RHEL 8 and its derivatives unable to verify anything
++ Packages are reproducible: rebuilding a release produces byte identical deb and rpm files, every timestamp is derived from the build date recorded for the release
+- 32-bit ARM (armhf) is published as a deb package only, Enterprise Linux has no 32-bit ARM build

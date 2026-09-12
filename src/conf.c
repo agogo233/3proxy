@@ -7,12 +7,19 @@
 */
 
 #include "proxy.h"
+
+#ifdef WITH_HTTPSRV
+static int addhttprule(char *op, char *host, char *url, char *params);
+#endif
 #include "mdhash.h"
 #ifdef WITH_SSL
 void ssl_install(void);
 #endif
 #ifdef WITH_PCRE
 void pcre_install(void);
+#endif
+#ifdef WITH_TRANSPARENT
+void transparent_install(void);
 #endif
 #ifndef _WIN32
 #include <sys/resource.h>
@@ -35,7 +42,6 @@ _3proxy_mutex_t config_mutex;
 int haveerror = 0;
 int linenum = 0;
 
-FILE *writable;
 struct counter_header cheader = {"3CF", (time_t)0};
 struct counter_record crecord;
 
@@ -60,10 +66,6 @@ FILE * confopen(){
 			curconf += strlen(chrootp);
 	}
 #endif
-	if(writable) {
-		rewind(writable);
-		return writable;
-	}
 	return fopen(curconf, "r");
 }
 
@@ -158,7 +160,12 @@ int start_proxy_thread(struct child * chp){
 	pthread_attr_init(&pa);
 	pthread_attr_setstacksize(&pa,threadstacksize(conf.stacksize));
 	pthread_attr_setdetachstate(&pa,PTHREAD_CREATE_DETACHED);
-	pthread_create(&thread, &pa, startsrv, (void *)chp);
+	if(pthread_create(&thread, &pa, startsrv, (void *)chp)){
+		pthread_attr_destroy(&pa);
+		fprintf(stderr, "Failed to create service thread on line %d, try to set larger stacksize\n", linenum);
+		_3proxy_sem_unlock(conf.threadinit);
+		return(40);
+	}
 	pthread_attr_destroy(&pa);
 #endif
 	_3proxy_sem_lock(conf.threadinit);
@@ -253,12 +260,32 @@ static int h_proxy(int argc, unsigned char ** argv){
 		childdef.service = S_UDPPM;
 		childdef.helpmessage = " -s single packet UDP service for request/reply (DNS-like) services\n";
 	}
+#ifdef WITH_HTTPSRV
 	else if(!strcmp((char *)argv[0], "admin")) {
-		childdef.pf = adminchild;
+		/* The same service as httpsrv, with the administration pages
+		   declared for it. */
+		if(addhttprule("admin_counters", "*", "/C*", NULL) ||
+		   addhttprule("admin_reload", "*", "/R", NULL) ||
+		   addhttprule("admin_services", "*", "/S*", NULL) ||
+		   addhttprule("admin", "*", "**", NULL)){
+			fprintf(stderr, "Failed to declare the admin pages, line %d\n", linenum);
+			return 1;
+		}
+		childdef.pf = httpsrvchild;
 		childdef.port = 80;
 		childdef.isudp = 0;
-		childdef.service = S_ADMIN;
+		childdef.service = S_HTTPSRV;
 	}
+#endif
+#ifdef WITH_HTTPSRV
+	else if(!strcmp((char *)argv[0], "httpsrv")) {
+		childdef.pf = httpsrvchild;
+		childdef.port = 80;
+		childdef.isudp = 0;
+		childdef.service = S_HTTPSRV;
+		childdef.helpmessage = " HTTP server, /echo describes the connection, /data?size=N returns N bytes\n";
+	}
+#endif
 	else if(!strcmp((char *)argv[0], "dnspr")) {
 		childdef.pf = dnsprchild;
 		childdef.port = 53;
@@ -765,13 +792,116 @@ struct redirdesc redirs[] = {
     {R_SOCKS5P, "socks5+", sockschild},
     {R_SOCKS4B, "socks4b", sockschild},
     {R_SOCKS5B, "socks5b", sockschild},
-    {R_ADMIN, "admin", adminchild},
     {R_EXTIP, "extip", NULL},
+    {R_EXTPORT, "extport", NULL},
+    {R_INTPORT, "intport", NULL},
     {R_TLS, "tls", tlsprchild},
     {R_HA, "ha", NULL},
     {R_DNS, "dns", dnsprchild},
     {0, NULL, NULL}
 };
+
+#ifdef WITH_HTTPSRV
+/* Headers a rule adds are written as one argument, the lines separated by a
+   backslash and an n, because a configuration line cannot hold a line ending.
+   Those two characters become a real one here. A line ending which reached the
+   argument as itself is dropped: what goes on the wire is decided here and not
+   by whatever produced the string. */
+static unsigned char * parsehdrs(const unsigned char *arg)
+{
+	unsigned char *out, *o;
+	const unsigned char *p;
+	size_t len = strlen((char *)arg);
+
+	out = malloc(len * 2 + 3);
+	if(!out) return NULL;
+	for(p = arg, o = out; *p; p++){
+		if(*p == '\\' && p[1] == 'n'){
+			*o++ = '\r';
+			*o++ = '\n';
+			p++;
+			continue;
+		}
+		if(*p == '\r' || *p == '\n') continue;
+		*o++ = *p;
+	}
+	if(o == out || o[-1] != '\n'){
+		*o++ = '\r';
+		*o++ = '\n';
+	}
+	*o = 0;
+	return out;
+}
+
+/* An optional argument which a star, or nothing at all, leaves at its
+   default. */
+static int optnum(int argc, unsigned char **argv, int at, int def)
+{
+	if(argc <= at || !strcmp((char *)argv[at], "*")) return def;
+	return atoi((char *)argv[at]);
+}
+
+static void freehttprule(struct httprule *rule)
+{
+	if(rule->host.name) free(rule->host.name);
+	if(rule->url.name) free(rule->url.name);
+	if(rule->params) free(rule->params);
+	if(rule->ctype) free(rule->ctype);
+	if(rule->hdrs) free(rule->hdrs);
+	free(rule);
+}
+
+/* Installs one rule from code, for the pages a service predefines. */
+static int addhttprule(char *op, char *host, char *url, char *params)
+{
+    struct httprule *rule, *tail;
+    unsigned char hostbuf[64], urlbuf[128];
+
+	rule = malloc(sizeof(struct httprule));
+	if(!rule) return 1;
+	memset(rule, 0, sizeof(struct httprule));
+	rule->maxage = -1;
+
+	rule->op = httpopbyname((unsigned char *)op);
+	if(rule->op < 0){
+		free(rule);
+		return 1;
+	}
+
+	strcpy((char *)hostbuf, host);
+	strcpy((char *)urlbuf, url);
+	if(parsepattern(&rule->host, hostbuf) || parsepathpattern(&rule->url, urlbuf)){
+		free(rule->host.name);
+		free(rule);
+		return 1;
+	}
+	if(params) rule->params = (unsigned char *)strdup(params);
+
+	if(!conf.httprules) conf.httprules = rule;
+	else {
+		for(tail = conf.httprules; tail->next; tail = tail->next);
+		tail->next = rule;
+	}
+	return 0;
+}
+#endif
+
+/* Parses an inclusive FIRST-LAST local port range into first | last << 16. */
+static int parserange(unsigned char *arg, uint32_t *range)
+{
+	char *end;
+	unsigned long first, last;
+
+	first = strtoul((char *)arg, &end, 10);
+	if(end == (char *)arg || *end != '-' || !first || first > 65535) return 1;
+
+	arg = (unsigned char *)end + 1;
+	last = strtoul((char *)arg, &end, 10);
+	if(end == (char *)arg || *end || !last || last > 65535 || last < first) return 1;
+
+	*range = (uint32_t)first | ((uint32_t)last << 16);
+	return 0;
+}
 
 static int h_parent(int argc, unsigned char **argv){
   struct ace *acl = NULL;
@@ -838,7 +968,39 @@ static int h_parent(int argc, unsigned char **argv){
 		*cidr = '/';
 		chains->cidr = atoi(cidr + 1);
 	}
-	*SAPORT(&chains->addr) = htons((uint16_t)atoi((char *)argv[4]));
+	if(chains->type == R_EXTPORT || chains->type == R_INTPORT){
+		if(!SAISNULL(&chains->addr)){
+			fprintf(stderr, "Chaining error: chain type (%s) sets a local port range, it requires 0.0.0.0 as address on line %d\n", argv[2], linenum);
+			free(chains->exthost);
+			free(chains);
+			return(4);
+		}
+		if(parserange(argv[4], &chains->range)){
+			fprintf(stderr, "Chaining error: bad port range (%s) on line %d\n", argv[4], linenum);
+			free(chains->exthost);
+			free(chains);
+			return(3);
+		}
+	}
+	else *SAPORT(&chains->addr) = htons((uint16_t)atoi((char *)argv[4]));
+	switch(chains->type){
+	    case R_POP3:
+	    case R_SMTP:
+	    case R_FTP:
+	    case R_ADMIN:
+	    case R_TLS:
+	    case R_DNS:
+	    case R_HA:
+		if(!SAISNULL(&chains->addr) || *SAPORT(&chains->addr)){
+			fprintf(stderr, "Chaining error: chain type (%s) is a local redirection, it requires 0.0.0.0 as address and 0 as port on line %d\n", argv[2], linenum);
+			free(chains->exthost);
+			free(chains);
+			return(4);
+		}
+		break;
+	    default:
+		break;
+	}
 	if(argc > 5) chains->extuser = (unsigned char *)strdup((char *)argv[5]);
 	if(argc > 6) chains->extpass = (unsigned char *)strdup((char *)argv[6]);
 	if(!acl->chains) {
@@ -853,6 +1015,103 @@ static int h_parent(int argc, unsigned char **argv){
 	return 0;
 	
 }
+
+#ifdef WITH_HTTPSRV
+/* http <hostname> <url> <operation> [parameters]
+   Rules are matched in the order they are given, first match wins. */
+static int h_http(int argc, unsigned char **argv){
+    struct httprule *rule, *tail;
+    int op;
+
+	/* http OPERATION HOST URL [PARAMETERS] */
+	op = httpopbyname(argv[1]);
+	if(op < 0){
+		fprintf(stderr, "Unknown http operation: %s line %d\n", argv[1], linenum);
+		return(1);
+	}
+
+	rule = malloc(sizeof(struct httprule));
+	if(!rule) return(21);
+	memset(rule, 0, sizeof(struct httprule));
+	rule->op = op;
+	rule->maxage = -1;
+
+	if(parsepattern(&rule->host, argv[2]) || parsepathpattern(&rule->url, argv[3])){
+		fprintf(stderr, "No memory for http rule, line %d\n", linenum);
+		free(rule->host.name);
+		free(rule);
+		return(21);
+	}
+
+	if(argc > 4 && (!strcmp((char *)argv[1], "file") || !strcmp((char *)argv[1], "cache"))){
+		/* PATH [TYPE [MAX-AGE [HEADERS [CODE]]]]. A star, or nothing,
+		   leaves each of them out: the type is worked out from the name,
+		   nothing is said about caching, no headers are added and the
+		   answer is the usual 200. */
+		rule->params = (unsigned char *)strdup((char *)argv[4]);
+		if(argc > 5 && strcmp((char *)argv[5], "*"))
+			rule->ctype = (unsigned char *)strdup((char *)argv[5]);
+		rule->maxage = optnum(argc, argv, 6, -1);
+		if(argc > 7 && strcmp((char *)argv[7], "*"))
+			rule->hdrs = parsehdrs(argv[7]);
+		rule->code = optnum(argc, argv, 8, 0);
+		if(!rule->params
+		   || (argc > 5 && strcmp((char *)argv[5], "*") && !rule->ctype)
+		   || (argc > 7 && strcmp((char *)argv[7], "*") && !rule->hdrs)){
+			freehttprule(rule);
+			return(21);
+		}
+	}
+	else if(!strcmp((char *)argv[1], "reply")){
+		/* CODE [HEADERS], and no body at all. */
+		rule->code = optnum(argc, argv, 4, 200);
+		if(argc > 5 && strcmp((char *)argv[5], "*")){
+			rule->hdrs = parsehdrs(argv[5]);
+			if(!rule->hdrs){
+				freehttprule(rule);
+				return(21);
+			}
+		}
+	}
+	else if(argc > 4){
+		/* What follows the URL belongs to the operation, and an operation
+		   such as redir reads more than one word of it. */
+		int i, len = 0;
+
+		for(i = 4; i < argc; i++) len += (int)strlen((char *)argv[i]) + 1;
+		rule->params = malloc(len);
+		if(rule->params){
+			int at = 0;
+
+			for(i = 4; i < argc; i++)
+				at += sprintf((char *)rule->params + at, "%s%s",
+					i > 4? " " : "", argv[i]);
+		}
+		if(!rule->params){
+			freehttprule(rule);
+			return(21);
+		}
+	}
+
+	if(rule->code && (rule->code < 100 || rule->code > 599)){
+		fprintf(stderr, "Wrong http status: %d line %d\n", rule->code, linenum);
+		freehttprule(rule);
+		return(1);
+	}
+	if(rule->maxage < -1){
+		fprintf(stderr, "Wrong max-age, line %d\n", linenum);
+		freehttprule(rule);
+		return(1);
+	}
+
+	if(!conf.httprules) conf.httprules = rule;
+	else {
+		for(tail = conf.httprules; tail->next; tail = tail->next);
+		tail->next = rule;
+	}
+	return 0;
+}
+#endif
 
 static int h_nolog(int argc, unsigned char **argv){
   struct ace *acl = NULL;
@@ -992,20 +1251,7 @@ struct ace * make_ace (int argc, unsigned char ** argv){
 					return(NULL);
 				}
 				memset(hostnamel, 0, sizeof(struct hostname));
-				hostnamel->matchtype = 3;
-				pattern = arg;
-				if(pattern[arglen-1] == '*'){
-					arglen --;
-					pattern[arglen] = 0;
-					hostnamel->matchtype ^= MATCHEND;
-				}
-				if(pattern[0] == '*'){
-					pattern++;
-					arglen--;
-					hostnamel->matchtype ^= MATCHBEGIN;
-				}
-				hostnamel->name = (unsigned char *) strdup( (char *)pattern);
-				if(!hostnamel->name) {
+				if(parsepattern(hostnamel, arg)) {
 					fprintf(stderr, "No memory for ACL entry, line %d\n", linenum);
 					return(NULL);
 				}
@@ -1352,7 +1598,7 @@ static int h_ace(int argc, unsigned char **argv){
 		tl->ace = acl;
 	
 		if((acl->action == COUNTIN)||(acl->action == COUNTOUT)||(acl->action == COUNTALL)) {
-			unsigned long lim;
+			uint64_t lim = 0;
 
 			tl->comment = ( char *)argv[1];
 			while(isdigit(*tl->comment))tl->comment++;
@@ -1360,9 +1606,9 @@ static int h_ace(int argc, unsigned char **argv){
 			tl->comment = strdup(tl->comment);
 
 			sscanf((char *)argv[1], "%u", &tl->number);
-			sscanf((char *)argv[3], "%lu", &lim);
+			if(sscanf((char *)argv[3], "%"SCNu64"", &lim) != 1) lim = 0;
 			tl->type = getrotate(*argv[2]);
-			tl->traflim64 =  ((uint64_t)lim)*(1024*1024);
+			tl->traflim64 =  lim*(1024*1024);
 			if(!tl->traflim64) {
 				free(tl);
 				freeacl(acl);
@@ -1478,6 +1724,11 @@ static int h_plugin(int argc, unsigned char **argv){
 #endif
 #ifdef WITH_PCRE
 	if(argc >= 3 && !strcmp((char *)argv[2], "pcre_plugin")){
+		return 0;
+	}
+#endif
+#ifdef WITH_TRANSPARENT
+	if(argc >= 3 && !strcmp((char *)argv[2], "transparent_plugin")){
 		return 0;
 	}
 #endif
@@ -1653,6 +1904,13 @@ int h_server_verify(int argc, unsigned char **argv);
 int h_no_server_verify(int argc, unsigned char **argv);
 int h_client_mode(int argc, unsigned char **argv);
 #endif
+#ifdef WITH_HTTPSRV
+int h_http_content_type(int argc, unsigned char **argv);
+#endif
+#ifdef WITH_TRANSPARENT
+int h_transparent(int argc, unsigned char **argv);
+int h_notransparent(int argc, unsigned char **argv);
+#endif
 #ifdef WITH_PCRE
 int h_pcre(int argc, unsigned char **argv);
 int h_pcre_rewrite(int argc, unsigned char **argv);
@@ -1669,7 +1927,14 @@ struct commands commandhandlers[]={
 	{NULL,  "socks", h_proxy, 1, 0},
 	{NULL,  "tcppm", h_proxy, 4, 0},
 	{NULL,  "udppm", h_proxy, 4, 0},
+#ifdef WITH_HTTPSRV
 	{NULL,  "admin", h_proxy, 1, 0},
+#endif
+#ifdef WITH_HTTPSRV
+	{NULL,  "httpsrv", h_proxy, 1, 0},
+	{NULL,  "http", h_http, 4, 0},
+	{NULL,  "http_content_type", h_http_content_type, 3, 3},
+#endif
 	{NULL,  "dnspr", h_proxy, 1, 0},
 	{NULL,  "internal", h_internal, 2, 2},
 	{NULL, "external", h_external, 2, 2},
@@ -1776,6 +2041,10 @@ struct commands commandhandlers[]={
 	{NULL, "ssl_client_mode", h_client_mode, 1, 2},
 	{NULL, "ssl_certcache", h_certcache, 2, 2},
 #endif
+#ifdef WITH_TRANSPARENT
+	{NULL, "transparent", h_transparent, 1, 2},
+	{NULL, "notransparent", h_notransparent, 1, 1},
+#endif
 #ifdef WITH_PCRE
 	{NULL, "pcre", h_pcre, 4, 0},
 	{NULL, "pcre_rewrite", h_pcre_rewrite, 5, 0},
@@ -1820,6 +2089,21 @@ int parsestr (unsigned char *str, unsigned char **argm, int nitems, unsigned cha
 			argm[argc] = 0;
 			return argc;
 		case '$':
+			/* Two dollars stand for one. That is how a literal dollar is
+			   written where a file to include would otherwise be read, and
+			   the second one is dropped here as a quote character is. */
+			if(str[1] == '$'){
+				str1 = str;
+				do {
+					*str1 = *(str1 + 1);
+				}while(*(str1++));
+				if(space){
+					argm[argc++] = str;
+					if(argc >= nitems) return argc;
+					space = 0;
+				}
+				break;
+			}
 			if(comment){
 				if(space){
 					argm[argc++] = str;
@@ -1916,16 +2200,6 @@ int readconfig(FILE * fp){
 	argv[argc] = NULL;
 	if(!strcmp((char *)argv[0], "end") && argc == 1) {	
 		break;
-	}
-	else if(!strcmp((char *)argv[0], "writable") && argc == 1) {	
-		if(!writable){
-			writable = freopen(curconf, "r+", fp);
-			if(!writable){
-				fprintf(stderr, "Unable to reopen config for writing: %s\n", curconf);
-				return 1;
-			}
-		}
-		continue;
 	}
 
 	res = 1;
@@ -2077,6 +2351,9 @@ int reload (void){
 #ifdef WITH_PCRE
 	pcre_install();
 #endif
+#ifdef WITH_TRANSPARENT
+	transparent_install();
+#endif
 	conf.paused++;
 	freeconf(&conf);
 	conf.paused++;
@@ -2088,7 +2365,7 @@ int reload (void){
 		if(error) {
 			 freeconf(&conf);
 		}
-		if(!writable)fclose(fp);
+		fclose(fp);
 	}
 	_3proxy_mutex_unlock(&config_mutex);
 	return error;

@@ -6,12 +6,51 @@
 
 ### Branches
 
-- **Master** (stable) branch - 3proxy 0.9
-- **Devel** branch - 3proxy 10 (don't use it)
+- **Master** (current/latest) branch - 3proxy 1.0
+- **0.9** (LTS) branch - 3proxy 0.9.9.x
+- **Devel** branch - 3proxy 2.0-devel (don't use it)
 
 ### Binaries (deb / rpm / Windows zip)
 
 https://github.com/3proxy/3proxy/releases
+
+### Package repository (apt / dnf)
+
+Signed apt and dnf repositories are published at https://3proxy.org/repo/ in
+two channels: `current` (master) and `lts` (0.9 branch).
+
+Debian 12 and Ubuntu 22.04 or newer:
+
+```
+sudo curl -fsSL https://3proxy.org/repo/3proxy-release-key.asc \
+     -o /usr/share/keyrings/3proxy.asc
+sudo tee /etc/apt/sources.list.d/3proxy.sources <<EOF
+Types: deb
+URIs: https://3proxy.org/repo/deb
+Suites: current
+Components: main
+Signed-By: /usr/share/keyrings/3proxy.asc
+EOF
+sudo apt update && sudo apt install 3proxy
+```
+
+AlmaLinux, RHEL, Rocky and CentOS Stream 8, 9 and 10:
+
+```
+sudo tee /etc/yum.repos.d/3proxy.repo <<EOF
+[3proxy]
+name=3proxy
+baseurl=https://3proxy.org/repo/rpm/current/el\$releasever/\$basearch/
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://3proxy.org/repo/3proxy-release-key.asc
+EOF
+sudo dnf install 3proxy
+```
+
+Both the packages and the repository metadata are signed. See
+https://3proxy.org/repo/ for the `lts` channel and for release key details.
 
 ### Docker images
 
@@ -29,7 +68,9 @@ Documentation (man pages and HTML) available with download, on https://3proxy.or
 
 ## Docker images
 
-3 docker configurations are provided, default (full) also tagged as `:latest`, `:busybox` and `:minimal`, all refer to newest stable version. Except busybox, images are distroless and contain only binaries, you can not sh inside the container. `:busybox` contains busybox shell.
+3 docker configurations are provided, default (full) also tagged as `:latest`, `:busybox` and `:minimal`, all refer to newest stable version. Except busybox, images are distroless and contain only binaries, you can not sh inside the container. `:busybox` contains busybox shell. Images are based on current (master) branch.
+
+Images marked as LTS (`:lts`, `:lts-busybox`, `:lts-minimal`) are built from LTS branch (0.9.9.x)
 
 ### Default image (`:latest`):
 

@@ -329,6 +329,11 @@ int MODULEMAINFUNC (int argc, char** argv){
 #endif
 #ifdef WITHSPLICE
 	" -s Use splice() - no filtering for data, off by default\n"
+	" -C connection closed by any of the sides terminates the session, by default\n"
+	"    the session is kept until both sides close it (TCP half-close)\n"
+	" -U(0-3) (for socks) what to do when the destination changes within an UDP\n"
+	"    association: 1 - log, 2 - authorize, 3 - both (default), 0 (same as -U) -\n"
+	"    neither. The first destination is always authorized and logged\n"
 #endif
 	"-g(GRACE_TRAFF,GRACE_NUM,GRACE_DELAY) - delay GRACE_DELAY milliseconds before polling if average polling size below  GRACE_TRAFF bytes and GRACE_NUM read operations in single directions are detected within 1 second to minimize polling\n"
 	" -fFORMAT logging format (see documentation)\n"
@@ -408,6 +413,15 @@ int MODULEMAINFUNC (int argc, char** argv){
  }
 #endif
  srv.service = defparam.service = childdef.service;
+
+#ifdef WITH_HTTPSRV
+ /* http lines accumulate until a service claims them, so each httpsrv takes
+    the rules written above it and the next one starts empty. */
+ if(srv.service == S_HTTPSRV){
+	srv.httprules = conf.httprules;
+	conf.httprules = NULL;
+ }
+#endif
  
 #ifndef STDMAIN
  if(conf.acl){
@@ -500,8 +514,8 @@ int MODULEMAINFUNC (int argc, char** argv){
 			}
 			break;
 		 case 'N':
-			if(argv[i][3] == 'e') getip46(46, (unsigned char *)argv[i]+3, (struct sockaddr *)&srv.extNat);
-			else if(argv[i][3] == 'i') getip46(46, (unsigned char *)argv[i]+3, (struct sockaddr *)&srv.intNat);
+			if(argv[i][2] == 'e') getip46(46, (unsigned char *)argv[i]+3, (struct sockaddr *)&srv.extNat);
+			else if(argv[i][2] == 'i') getip46(46, (unsigned char *)argv[i]+3, (struct sockaddr *)&srv.intNat);
 			else getip46(46, (unsigned char *)argv[i]+2, (struct sockaddr *)&srv.extNat);
 			break;
 		 case 'n':
@@ -595,6 +609,12 @@ int MODULEMAINFUNC (int argc, char** argv){
 			break;
 		case 'g':
 			sscanf(argv[i]+2, "%d,%d,%d", &srv.gracetraf, &srv.gracenum, &srv.gracedelay);
+			break;
+		case 'C':
+			srv.halfclose = *(argv[i]+2)? atoi(argv[i]+2) : 0;
+			break;
+		case 'U':
+			srv.udpauth = *(argv[i]+2)? atoi(argv[i]+2) : 0;
 			break;
 		case 's':
 #ifdef WITHSPLICE
@@ -815,10 +835,21 @@ int MODULEMAINFUNC (int argc, char** argv){
    port there, and it only allows another local process to bind the same
    address and port, with undefined behaviour as to which socket receives the
    connections. Use -olSO_EXCLUSIVEADDRUSE to prevent that instead.
+
+   A Windows build which does not share the listening socket is the exception:
+   its UDP services bind a second socket to the same address to answer from,
+   and Windows only allows that when both sockets ask for it.
  */
 #ifndef _WIN32
 		opt = 1;
 		if(srv.so._setsockopt(srv.so.state, sock, SOL_SOCKET, SO_REUSEADDR, (char *)&opt, sizeof(int)))perror("setsockopt()");
+#else
+#ifndef SHARE_UDP_SOCKET
+		if(isudp){
+			opt = 1;
+			if(srv.so._setsockopt(srv.so.state, sock, SOL_SOCKET, SO_REUSEADDR, (char *)&opt, sizeof(int)))perror("setsockopt()");
+		}
+#endif
 #endif
 #ifdef SO_REUSEPORT
 		opt = 1;
@@ -1247,6 +1278,8 @@ void srvinit(struct srvparam * srv, struct clientparam *param){
 #ifdef WITHSPLICE
  srv->usesplice = 0;
 #endif
+ srv->halfclose = 1;
+ srv->udpauth = 3;
  memset(param, 0, sizeof(struct clientparam));
  param->srv = srv;
  param->version = srv->version;
@@ -1322,6 +1355,9 @@ void srvfree(struct srvparam * srv){
  }
 
  if(srv->acl)freeacl(srv->acl);
+#ifdef WITH_HTTPSRV
+ if(srv->httprules)freehttprules(srv->httprules);
+#endif
  if(srv->authfuncs)freeauth(srv->authfuncs);
 #endif
  _3proxy_mutex_destroy(&srv->counter_mutex);
@@ -1349,7 +1385,6 @@ void srvfree(struct srvparam * srv){
 
 
 void freeparam(struct clientparam * param) {
-	if(param->res == 2) return;
 	if(param->srv){
 		if(param->srv->so.freefunc) param->srv->so.freefunc(param->sostate);
 		_3proxy_mutex_lock(&param->srv->counter_mutex);

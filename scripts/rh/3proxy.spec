@@ -1,5 +1,5 @@
 Name:           3proxy
-Version:        0.9.7
+Version:        1.0.0
 Release:        1%{?dist}
 Summary:        3proxy tiny proxy server
 License:        GPL/LGPL/Apache/BSD
@@ -8,6 +8,9 @@ Vendor:         3proxy.org 3proxy@3proxy.org
 Prefix:         %{_prefix}
 Packager: 	z3APA3A
 Source:		https://github.com/%{packager}/%{name}/archive/%{version}.tar.gz
+
+%global debug_package %{nil}
+%global __requires_exclude ^/(usr/)?bin/3proxy$
 
 %description
 3proxy is lightweight yet powerful proxy server
@@ -34,6 +37,7 @@ make clean
 /bin/3proxy
 /bin/3proxy_crypt
 /bin/3proxy_ftppr
+/bin/3proxy_imapp
 /bin/3proxy_pop3p
 /bin/3proxy_proxy
 /bin/3proxy_smtpp

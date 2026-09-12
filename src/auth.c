@@ -18,7 +18,14 @@ int alwaysauth(struct clientparam * param){
 
 
 	if(conf.connlimiter && !param->connlim  && startconnlims(param)) return 10;
+#ifdef WITH_HTTPSRV
+	/* The http server answers the request itself, so authorization must not
+	   try to reach a destination that does not exist. A request it has handed
+	   to another child does have one, and that child needs it opened. */
+	res = (param->srv->service == S_HTTPSRV && !param->onerequest)? 0 : doconnect(param);
+#else
 	res = doconnect(param);
+#endif
 	if(!res){
 		if(conf.bandlimfunc && (conf.bandlimiter||conf.bandlimiterout)){
 			_3proxy_mutex_lock(&bandlim_mutex);
@@ -102,6 +109,7 @@ int cacheauth(struct clientparam * param){
 	    *(SAFAMILY(&param->sinsl)) = ac.sinsl_family;
 	    memcpy(SAADDR(&param->sinsl), ac.sinsl_addr, SAADDRLEN(&param->sinsl));
 	}
+	if(param->preauth == 1 && param->srv->acl) param->dstindep = 0;
 	return 0;
 }
 
@@ -110,6 +118,7 @@ int doauth(struct clientparam * param){
 	struct auth *authfuncs;
 	int ret = 0;
 
+	if(param->preauth == 1 && !param->srv->acl) param->dstindep = 1;
 	for(authfuncs=param->srv->authfuncs; authfuncs; authfuncs=authfuncs->next){
 		res = authfuncs->authenticate?(*authfuncs->authenticate)(param):0;
 		if(!res) {
@@ -148,7 +157,7 @@ int doauth(struct clientparam * param){
 		if(ret > 9) return ret;
 	}
 	if(!res){
-		ret = alwaysauth(param);
+		ret = (param->preauth == 2)? 0 : alwaysauth(param);
 		if (param->afterauthfilters){
 		    FILTER_ACTION action;
 

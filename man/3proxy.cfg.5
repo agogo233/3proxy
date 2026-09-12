@@ -39,7 +39,9 @@ For included file <CR> (end of line characters) is treated as space character
 (arguments delimiter instead of end of command delimiter). 
 Thus, include files are only useful to store long single-line commands
 (like userlist, network lists, etc).
-To use dollar sign somewhere in argument it must be quoted. 
+To use dollar sign somewhere in argument it must be quoted or doubled: inside
+quotes a dollar is ordinary text, and \fB$$\fR stands for a single dollar and is
+not read as an include.
 Recursion is not allowed.
 
 .br
@@ -132,7 +134,8 @@ change default server port to NUMBER
 Only resolve IPv6 addresses. IPv4 addresses are packed in IPv6 in IPV6_V6ONLY compatible way.
 .br
 .B -4
-Only resolve IPv4 addresses
+Only resolve IPv4 addresses. This is the default: a service reaches an IPv6
+address only when told to with \fB-6\fR, \fB-46\fR or \fB-64\fR.
 .br
 .B -46
 Prefer IPv4. Resolve IPv6 addresses if IPv4 address is not resolvable
@@ -200,6 +203,26 @@ SPLICE_F_MOVE, so no real zero-copy takes place and the read/write path is faste
 for most traffic. Rebuild with -DWITHSPLICE to make -s available, -s0 disables it
 explicitly.
 .br
+.B -C
+ (for TCP services) a connection closed by any of the sides terminates the
+session, buffered data is delivered before the sockets are closed. By default
+the session is kept until both sides close the connection (TCP half-close).
+Half-close is required for the protocols where one of the sides closes its
+sending side and expects the answer, but it keeps the socket of the side which
+has already closed the connection in CLOSE_WAIT state. Use -C to close both
+sockets as soon as any of the sides closes the connection, -C1 to request
+the default behaviour explicitly.
+.br
+.B -U\fI[MODE]\fR
+ (for socks) what to do when the destination changes within an UDP association:
+\fB1\fR - log it, \fB2\fR - authorize it, \fB3\fR - both, the default,
+\fB0\fR (same as bare \fB-U\fR) - neither. The destination of the first datagram
+is always authorized and logged. With \fB-U0\fR and \fB-U1\fR the destination is
+not authorized again, so ACLs limiting the destination only apply to the first
+destination of the association, and the parent proxy and the external address
+selected for it are kept for the whole association. Use \fB-U2\fR to keep the
+authorization and to drop the per-destination log records only.
+.br
  (for dnspr) simple, do not use resolver and 3proxy cache, always use external DNS server.
 .br
  (for udppm) singlepacket, expect only one packet from both client and server
@@ -262,16 +285,7 @@ proxy on a client with FTP proxy support. Username format is one of
 .BR config
 \fI<path>\fR
 .br
- Path to configuration file to use on 3proxy restart or to save configuration.
-
-.br
-.B writable
-.br
- ReOpens configuration file for write access via Web interface,
-and rereads it. Usually should be first command on config file
-but in combination with config
-it can be used anywhere to open
-alternate config file. Think twice before using it.
+ Path to configuration file to use on 3proxy restart.
 
 .br
 .B end
@@ -427,9 +441,9 @@ can use %A as produced archive name and %F as filename.
 
 .br
 .BR timeouts
-\fI<BYTE_SHORT>\fR \fI<BYTE_LONG>\fR \fI<STRING_SHORT>\fR \fI<STRING_LONG>\fR \fI<CONNECTION_SHORT>\fR \fI<CONNECTION_LONG>\fR \fI<DNS>\fR \fI<CHAIN>\fR \fI<CONNECT>\fR \fI<CONNECTBACK>\fR
+\fI<BYTE_SHORT>\fR \fI<BYTE_LONG>\fR \fI<STRING_SHORT>\fR \fI<STRING_LONG>\fR \fI<CONNECTION_SHORT>\fR \fI<CONNECTION_LONG>\fR \fI<DNS>\fR \fI<CHAIN>\fR \fI<CONNECT>\fR \fI<CONNECTBACK>\fR \fI<LINGER>\fR
 .br
- Sets timeout values, defaults 1, 5, 30, 60, 180, 1800, 15, 60, 15, 5.
+ Sets timeout values, defaults 1, 5, 30, 60, 180, 1800, 15, 60, 15, 5, 5.
 .br
  \fBBYTE_SHORT\fR short timeout for single byte, is usually used for receiving single byte from stream.
 .br
@@ -447,7 +461,12 @@ can use %A as produced archive name and %F as filename.
 .br
  \fBCHAIN\fR timeout for reading data from chained connection
 .br
- default timeouts 1 5 30 60 180 1800 15 60 15 5
+ \fBLINGER\fR timeout to deliver buffered data after one of the sides has closed
+its sending side, also used as SO_LINGER value on outgoing connections. Too small
+value may cause the tail of the data to be lost on slow connections, too large one
+delays release of the sockets.
+.br
+ default timeouts 1 5 30 60 180 1800 15 60 15 5 5
 
 .br
 .BR maxseg
@@ -505,13 +524,20 @@ If not specified, nserver is used. The syntax is the same as for nserver.
 .br
  Cache \fI<cachesize>\fR records for name resolution (\fBnscache\fR for IPv4,
 \fBnscache6\fR for IPv6). The cache size should usually be large enough
-(for example, 65536).
+(for example, 65536). The two are separate: a name that resolves to an IPv6
+address, including one given with \fBnsrecord\fR, is only held when
+\fBnscache6\fR is configured, and \fBnscache\fR does nothing for it. Both
+caches are global rather than per-service.
 
 .br
 .BR nsrecord
 \fI<hostname>\fR \fI<hostaddr>\fR
 .br
- Adds static record to nscache. \fBnscache\fR must be enabled. If 0.0.0.0
+ Adds static record to nscache. \fBnscache\fR must be enabled and must come
+first, because the record is placed in the table it allocates - \fBnscache6\fR
+for a record naming an IPv6 address - and
+\fBnserver\fR must be set as well: without it the system resolver is used and
+static records are never consulted. If 0.0.0.0
 is used as a hostaddr host will never resolve, it can be used to
 blacklist something or together with 
 .B dialer
@@ -623,6 +649,13 @@ SOCKSv5, FTP, POP3 and HTTP proxy.
 authorization result is also cached and not re-evaluated on each request. Faster
 than \fBcache\fR, but ACL changes do not take effect for cached users until the
 cache entry expires. Use \fBcache\fR if ACLs may change during the cache lifetime.
+Because the ACL is not walked on a cache hit, no redirection is applied to a
+request served from the cache: it is sent directly instead of through the
+\fBparent\fR proxy of the matching ACL entry, with no error reported. Do not use
+\fBcacheacl\fR together with parent proxies, use \fBcache\fR instead. The only
+redirection type which survives is \fBextip\fR, and only if \fBext\fR is a part
+of the \fBauthcache\fR key, because the external address is then restored from
+the cache entry.
 .br
  \fBradius\fR - authentication with RADIUS.
 .br
@@ -678,6 +711,17 @@ assigned to the same user without actual authentication.
 .br
 Multiple types can be combined (e.g. \fBip,user,dstaddr,dstport\fR).
 .br
+With \fBcacheacl\fR the ACL result is not re-evaluated on a cache hit, so every
+field the ACL limits must be a part of the cache key, otherwise the result
+cached for one request is applied to a different one: \fBuser\fR/\fBpass\fR
+for the userlist, \fBip\fR for the sourcelist, \fBdstaddr\fR/\fBdsthost\fR
+for the targetlist, \fBdstport\fR for the targetportlist and \fBdstoper\fR
+for the operationlist. It is especially important for SOCKSv5 UDP traffic,
+where the destination of every datagram is authorized: without \fBdstaddr\fR
+and \fBdstport\fR in the key the result cached for one destination is applied
+to any other destination and the destination is not checked at all, see
+\fBallow\fR.
+.br
 Use auth type \fBcache\fR (or \fBcacheacl\fR) for cached authentication
 
 .br
@@ -701,6 +745,17 @@ Since 0.6, the targetlist may also contain host names,
 instead of addresses. It\'s possible to use a wildmask in
 the beginning and at the end of the hostname, e.g. *badsite.com or *badcontent*.
 The hostname is only checked if a hostname is present in the request.
+A name written with a \fBpcre:\fR prefix (\fBregex:\fR is the same thing) is a
+regular expression instead of a wildmask, in a build with PCRE support:
+.br
+ deny * * "pcre:^(ads|track)[0-9]*\\.example\\.(com|net)$"
+.br
+ The name is lowercased and any trailing dots are removed before it is matched,
+so patterns are written in lower case. A pattern ending in \fB$\fR has to be
+quoted or written \fB$$\fR, since a lone dollar outside quotes begins the name
+of a file to include. The same patterns, and the same prefix, are used by the
+\fBhttp\fR command, see BUILT IN HTTP SERVER. Regular expressions are matched
+per request and cost more than a wildmask, which is enough for most rules.
 Targetportlist may contain ports (X) or port ranges lists (X-Y). For any field *
 sign means ANY. If access list is empty it\'s assumed to be
 .br
@@ -762,6 +817,39 @@ non-privileged (1024-65535) ports on the remote side.
 .br
  Timeperiodlists is a list of time
 periods in HH:MM:SS-HH:MM:SS format. For example, 00:00:00-08:00:00,17:00:00-24:00:00 lists non-working hours.
+.br
+ A SOCKSv5 UDP ASSOCIATE request carries no destination, the destination of
+every datagram is taken from the datagram itself. 3proxy authorizes the
+destination of every datagram, so ACLs limiting the destination address, the
+destination host name or the destination port do apply to UDP traffic, unless
+the \fB-U\fR option of the \fBsocks\fR service says otherwise.
+.br
+ ACLs are only checked for the datagrams sent by the client. A datagram received
+on the association is relayed to the client without an ACL check: with a parent
+proxy only the datagrams from the parent are accepted, an association without a
+parent accepts a datagram from any source. The source reported to the client is
+the actual source of the datagram. The address in the log record is the destination the
+client sent the datagrams to, the source of the datagrams received on the
+association is not logged.
+.br
+ A client may use a single association to reach many destinations. An ACL entry
+which limits the destination silently drops the datagrams to every other
+destination, so limiting the destination of UDP traffic can break such clients
+in a way which is hard to diagnose. Limit it only when it is really required.
+.br
+ Bandwidth limiters (\fBbandlimin\fR, \fBbandlimout\fR) and traffic counters
+(\fBcountin\fR, \fBcountout\fR) which limit the destination are selected when
+the destination is authorized, so within an UDP association they are selected
+for the destination of the first datagram and are not re-selected for every
+following destination. They can not be applied per destination to the incoming
+UDP traffic at all, because an incoming datagram is not matched against any
+destination.
+.br
+ Only \fBsocks5\fR and \fBsocks5+\fR parents can be used for UDP. Because
+every new destination is authorized, use \fBauthcache\fR, especially with
+\'strong\', RADIUS or plugin authentication: \fBcacheacl\fR with the
+destination in the cache key if no parent proxy is used, \fBcache\fR
+otherwise, see \fBcacheacl\fR.
 
 .br
 .BR parent
@@ -803,6 +891,10 @@ with probability of 0.7) for outgoing web connections. Chains are only applied t
  type is one of:
 .br
  \fBextip\fR does not actually redirect the request; it sets the external address for this request to \fI<ip>\fR. It can be chained with another parent type. It's useful to set the external IP based on ACL or make it random.
+.br
+ \fBextport\fR does not redirect the request; it sets the range the local port of outgoing connections is taken from, given as \fIFIRST-LAST\fR inclusive in place of the port argument, with 0.0.0.0 as the address, for example \fBparent 1000 extport 0.0.0.0 40000-40100\fR. Where the system can be asked to pick the port itself (Linux \fBIP_LOCAL_PORT_RANGE\fR) it does, otherwise a port is picked at random from the range and retried if it is already in use, up to ten times. On Linux the range has to lie within \fInet.ipv4.ip_local_port_range\fR, commonly 32768-60999: the kernel ignores a range outside it and picks an ordinary ephemeral port instead. If no port in the range can be bound, an ephemeral port is used rather than failing the connection. It can be chained with another parent type, and the access rule it belongs to decides which requests it applies to, so \fBallow * * * * UDPASSOC\fR followed by \fBparent 1000 extport 0.0.0.0 40000-40100\fR limits it to UDP associations. The range is applied when the outgoing connection is made, so a kept alive connection carrying several requests uses the rule that matched when it was opened.
+.br
+ \fBintport\fR is the same for sockets bound on the side facing the client: the port a UDP association tells the client to send its datagrams to, and the FTP proxy data connection.
 .br
  \fBtcp\fR simply redirect connection. TCP is always last in chain. This type of proxy is a simple TCP redirection, it does not support parent authentication.
 .br
@@ -1113,6 +1205,54 @@ the format:
  Note: double quotes are required because the password contains a $ sign.
 
 .br
+.BR transparent
+\fI[auto|netfilter|pf|socket]\fR
+.br
+ Take the destination of a connection, both address and port, from the packet
+filter that redirected it, instead of from the request. It applies to services declared after it, and
+\fBnotransparent\fR turns it off again for the services after that. Built into the
+binary since 1.0.1, and previously the separate TransparentPlugin.
+.br
+ On Linux the kernel is asked, so \fBiptables\fR or \fBnftables\fR
+redirection is enough. On the BSDs pf is asked through \fB/dev/pf\fR, which
+3proxy must be able to read, so \fBrdr\fR rules work; a redirection that
+leaves the destination on the socket is used where there is one, as
+\fBdivert-to\fR on OpenBSD and \fBipfw fwd\fR on FreeBSD do. macOS ships no
+header for pf and has neither of those, so the commands exist in a macOS build
+but cannot be used.
+.br
+ The mechanism is chosen automatically. The optional argument pins it for an
+installation that has more than one: \fBauto\fR is the default,
+\fBnetfilter\fR asks the Linux kernel, \fBpf\fR looks the connection up in
+the packet filter, and \fBsocket\fR reads the address off the socket. A mode
+the build has no code for is refused rather than ignored.
+.br
+ A connection that reaches a \fBsocket\fR mode service without having been
+redirected is refused: its destination is the address the service listens on,
+and using that would send the service to itself.
+.br
+ A redirected connection carries no destination of its own, so without this the
+service uses whatever it would use otherwise: the \fBHost\fR header for an
+HTTP request, or the address a port mapper was configured with. \fBtlspr\fR
+receives nothing at all unless traffic is redirected to it or the clients
+resolve names to it, and with a redirection it has the address as well as the
+name from the handshake, which is what allows access rules to be written with
+host names. With it, every service reaches the address the
+client was trying to reach, and access rules, parents, limits and logging apply
+to it as usual.
+.br
+ The redirection rules must not match the connections the proxy itself makes to
+those destinations, or the traffic returns to the proxy and loops. Give the
+service an outgoing address with \fB-e\fR and exclude that address in the rules,
+or run 3proxy as its own user and exclude that user. See the
+.B TRANSPARENT PROXYING
+section of the documentation for rules per platform.
+.br
+.BR notransparent
+.br
+ Stop taking the destination from the packet filter for the services declared
+after it.
+
 .B flush
 .br
  empty the active access list. The access list must be flushed every time you create a
@@ -1361,7 +1501,7 @@ Apply a rule for matching regular expression.
 Match and replace with rewrite expression.
 .br
 .BR pcre_extend
-\fIFILTER_ACTION [ACE]\fR
+\fIACE\fR
 .br
 Extend the ACL of the last pcre or pcre_rewrite command by adding an additional ACE.
 .br
@@ -1384,6 +1524,15 @@ PCRE_NOTEMPTY, PCRE_UTF8, PCRE_NO_AUTO_CAPTURE, PCRE_NO_UTF8_CHECK, PCRE_AUTO_CA
 PCRE_PARTIAL, PCRE_DFA_SHORTEST, PCRE_DFA_RESTART, PCRE_FIRSTLINE, PCRE_DUPNAMES,
 PCRE_NEWLINE_CR, PCRE_NEWLINE_LF, PCRE_NEWLINE_CRLF, PCRE_NEWLINE_ANY, PCRE_NEWLINE_ANYCRLF,
 PCRE_BSR_ANYCRLF, PCRE_BSR_UNICODE.
+.br
+ These options apply to every pattern the configuration compiles, the host
+patterns of access rules and \fBhttp\fR rules included, so set them before the
+rules which are to use them.
+.br
+ Regular expressions are not only for these commands: a host name in the target
+list of an access rule, and the host and URL of an \fBhttp\fR rule, take one
+when it is written with a \fBpcre:\fR prefix. See \fBallow\fR and BUILT IN
+HTTP SERVER.
 
 .SS PCRE Parameters
 TYPE - type of filtered data (comma-delimited list):
@@ -1411,12 +1560,238 @@ REGEXP - PCRE (Perl) regular expression. Use * if no regexp matching is required
 REWRITE_EXPRESSION - substitution string. May contain Perl-style substrings
 $1, $2, etc. $0 means the whole matched string. \er and \en may be used
 to insert new lines; the string may be empty ("").
+.br
+A rewritten request is what the server receives. The destination is chosen,
+and the access rules are applied to it, before the filters run, so a rewrite
+that names another host or changes the method is logged but not acted on:
+the request is still sent where the access rules allowed. Rewriting the path
+or the query works on a direct connection and through a parent alike.
 
 ACE - access control entry (user names, source IPs, destination IPs, ports, etc.),
 identical to allow/deny/bandlimin commands. The regular expression is only
 matched if the ACL matches the connection data.
 Warning: Regular expressions don't require authentication and cannot replace
 authentication and/or allow/deny ACLs.
+
+.SH BUILT IN HTTP SERVER
+The \fBhttpsrv\fR service answers requests itself instead of forwarding them.
+What it does with a request is decided by \fBhttp\fR rules, which are taken in
+the order they are written: the first whose host and URL both match handles the
+request. Rules belong to the service that follows them, the way access rules do,
+and \fBadmin\fR is \fBhttpsrv\fR with a set of rules already in place.
+
+.BR http
+\fIOPERATION HOST URL [PARAMETERS]\fR
+.br
+ Handle a request for \fIURL\fR on \fIHOST\fR with \fIOPERATION\fR. HOST is
+matched against the Host header, URL against the path, with the query string
+removed.
+
+.SS Operations
+.br
+ \fBfile\fR \fIPATH [TYPE [MAX-AGE [HEADERS [CODE]]]]\fR - send the file at PATH.
+The file is handed to the socket by the system where it can do that (sendfile,
+TransmitFile) and read here where it cannot, as when the connection carries TLS.
+The arguments after PATH are described below, and each of them may be written as
+\fB*\fR to leave it out.
+.br
+ \fBcache\fR \fIPATH [TYPE [MAX-AGE [HEADERS [CODE]]]]\fR - the same, but the
+file is read into memory on the first request and answered from there afterwards.
+A file that has changed on disk is read again, and one larger than a megabyte is
+sent as \fBfile\fR would. With a MAX-AGE the file is not looked at again for
+that long: the rule has already told clients the file may be treated as
+unchanged for that time, so the server treats its own copy the same way and a
+request costs nothing but the copy out. Without one every request stats the
+file, so a change is picked up at once.
+.br
+ \fBreply\fR \fI[CODE [HEADERS]]\fR - answer with a status and nothing else.
+CODE is the status to send, 200 without one. A status which carries no body of
+its own (1xx, 204, 304) is sent without a length; anything else is sent with a
+length of zero.
+.br
+ \fBredir\fR \fI[CODE] LOCATION\fR - answer with a redirect. CODE is 301 or 302,
+or any status from 300 to 399; without one, 302 is used.
+.br
+ \fBrewrite\fR \fIPATH\fR - change the path of the request and hand it to the
+rules that follow this one.
+.br
+ \fBrewrite_host\fR \fIHOST\fR - the same for the host, which decides which of
+the rules after it match. \fB$1\fR upwards stand for what the stars, or the
+groups, of this rule\'s host pattern matched, the way they stand for those of
+the URL in a \fBrewrite\fR. What is built has to be a host name; the name the
+client sent is what access rules matched and what the log records.
+.br
+ \fBecho\fR - answer with a description of the request: the method, path, query,
+host, and the address and port it came from. For testing.
+.br
+ \fBdata\fR \fI[size=N] [block=N] [status=N] [chunked=1] [delay=N]\fR - answer
+with generated content of the size asked for. For testing.
+.br
+ \fBproxypass\fR - hand the request to the proxy code, which fetches it the
+way \fBproxy\fR would, see BOTH A SITE AND A PROXY.
+.br
+ \fBadmin\fR, \fBadmin_counters\fR, \fBadmin_reload\fR, \fBadmin_services\fR -
+the pages of the administration interface.
+
+.SS What a rule adds to the answer
+\fBTYPE\fR is the content type to answer with. Without it, or with \fB*\fR, the
+type is worked out from the name of the file, see \fBhttp_content_type\fR.
+.br
+ \fBMAX-AGE\fR is a number of seconds, and is sent as Cache-Control: max-age.
+Without it, or with \fB*\fR, nothing is said about caching.
+.br
+ \fBHEADERS\fR is one argument holding whole header lines, separated by a
+backslash and an n \- the two characters, since a configuration line cannot
+carry a line ending. Each becomes a real line ending in the answer. Quote the
+argument if any header holds a space, which they usually do.
+.br
+ \fBCODE\fR is the status to answer with instead of 200, which is how a file
+serves as the body of an error page.
+.br
+ A rule's headers and MAX-AGE go with whatever status that rule asked for. They
+are not sent with a refusal the server itself decided on: a request for a file
+which is not there is answered 404 by the server, not by the rule.
+.br
+ \fBfile\fR and \fBcache\fR send Last-Modified, and answer a request carrying
+If-Modified-Since with 304 and no body when the file has not changed since the
+time it names. All three date formats HTTP allows are read; one which cannot be
+read is treated as no date at all. A rule answering with a CODE of its own is
+answering something other than the file, so it is never turned into a 304.
+.br
+ http file * /err/** "/usr/local/web/404.html" text/html * "X-Served: static" 404
+.br
+ http reply * /health** 200 "X-Health: ok"
+.br
+ http reply * /down** 503 "Retry-After: 30"
+
+.BR http_content_type
+\fIEXTENSION TYPE\fR
+.br
+ Answer for a file with that extension with that content type, in addition to
+the types already known. The extension may be written with or without its dot.
+A type named by a rule is used whatever this says, and a name the server knows
+nothing about is answered as application/octet-stream.
+.br
+ http_content_type .webp image/webp
+
+.SS Patterns
+A URL is matched with stars, or with a regular expression when it carries a
+\fBpcre:\fR prefix (\fBregex:\fR is taken as well). A host is matched the way an
+access list matches one, and takes the same prefix.
+.br
+ \fB*\fR stands for any run of characters within one element of the path: it
+does not cross a \fB/\fR, so a rule cannot reach into a directory it did not
+name.
+.br
+ \fB**\fR crosses them, and is what a rule which should match everything below a
+point, or everything at all, is written with.
+.br
+ Each star, and each group of a regular expression, is remembered in the order
+it appears. \fB$1\fR upwards stand for them in the path or location a rule
+builds, and \fB$0\fR for the whole request path.
+.br
+ Outside quotes a dollar begins the name of a file to include, so an argument
+holding one \- a path or location built with \fB$1\fR, a regular expression
+anchored with \fB$\fR \- is written in quotes. \fB$$\fR stands for a single
+dollar and is not read as an include either, which is how a dollar reaches a
+rule as text.
+
+.SS Both a site and a proxy
+A request may arrive the way it arrives at a site, naming a path and a host in
+the Host header, or the way it arrives at a proxy, naming the whole URL, or, for
+a tunnel, the host alone with CONNECT. Both are read. A request in the proxy
+form authenticates with Proxy-Authorization and is refused with 407, as a proxy
+refuses one; a request in the site form uses Authorization and 401.
+.br
+ What answers a request is still decided by the rules. \fBproxypass\fR is the
+rule which answers by fetching, so a service can serve what it has and proxy the
+rest:
+.br
+ http file * /local/** "/usr/local/web/$1"
+.br
+ http proxypass * /**
+.br
+ httpsrv -p8080
+.br
+ The same happens without a rule for it where an access rule redirects to the
+local proxy, which is written as a chain of no address: the rules are asked
+first, and a request none of them answers is fetched.
+.br
+ allow *
+.br
+ parent 1000 http 0.0.0.0 0
+.br
+ allow *
+.br
+ The second \fBallow\fR is what the proxy matches on the pass it makes itself:
+a rule carrying the chain is not taken twice. Authentication happens twice for
+the same reason, once for the service and once for the proxy, so a configuration
+asking for credentials asks for them as a proxy does.
+.br
+ The access rules are read from the top on both passes, and it is the second
+pass which describes where the request is going. On the first one the service is
+answering for itself, so the destination an address or a port is matched against
+is the address the client connected to; the name from the request is matched on
+both. On the second the destination is the one the request names, so rules
+written with an address, a port or a name decide what the proxy is allowed to
+fetch, and they decide it before the connection is made:
+.br
+ allow *
+.br
+ parent 1000 http 0.0.0.0 0
+.br
+ allow * * * 80,443
+.br
+ deny *
+.br
+ Everything reaches the rules, and only ports 80 and 443 are fetched. A rule
+before the one carrying the chain applies on both passes just the same, so a
+\fBdeny\fR written there stops the request as well.
+.br
+ The connection to the server is kept for the request after it, and closed when
+the request after it goes somewhere else, or when the server has closed it in
+the meantime. A tunnel is fetched by the proxy code as well, which means the
+connection carrying it belongs to that request alone.
+
+.SS Connections
+An answer is sent as HTTP/1.1 to a client which asked in HTTP/1.1, and the
+connection is kept for the next request unless the client sent
+\fBConnection: close\fR. A 1.0 client gets a 1.0 answer, and the connection is
+kept only when it asked with \fBConnection: keep-alive\fR.
+.br
+ The connection is kept only when what was sent is framed exactly: every
+operation but the administration pages states a length, or sends a chunked body
+a 1.1 client can read, so the pages of \fBadmin\fR are always the last thing on
+a connection. A request body which cannot be read to its end ends the connection
+as well: one sent with \fBTransfer-Encoding\fR, which this server does not read,
+and one longer than a megabyte, which it will not.
+
+.SS Paths a rule builds
+The path a rule builds is used as it is, so it is refused rather than corrected
+when it is not a plain full path. A relative path is refused: it would be read
+against whatever directory the service happens to be in. So is one holding
+\fB.\fR or \fB..\fR as an element, a carriage return, a newline or a star. On
+Windows a path must name a drive or a share, and is converted to the extended
+\\\\?\\ form and opened through the wide interface, so a long path works.
+.br
+ A request is checked before any of this: a path which decodes to one leaving
+the tree is refused outright.
+
+.SS Examples
+.br
+ http file example.com /my/webpath/*.html "/usr/local/web/$1.html"
+.br
+ http cache example.com "pcre:^/(.*)/pic/(.*)\.(gif|jpeg)$" "/usr/local/web/picts/$1/$2.$3"
+.br
+ http redir * /old/** 301 "https://example.org/$1"
+.br
+ http rewrite * /alias/** "/w/$1"
+.br
+ http rewrite_host *.old.example ** "$1.new.example"
+.br
+ http file * /static/** "/usr/local/web/static/$1"
+.br
+ httpsrv -p8080
 
 .SH BUGS
 Report all bugs to

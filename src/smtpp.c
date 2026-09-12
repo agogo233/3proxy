@@ -159,7 +159,10 @@ void * smtppchild(struct clientparam* param) {
 	i = de64(buf,username,255);
 	if(i < 1) {RETURN(664);}
 	username[i] = 0;
-	parseconnusername((char *)username, param, 0, 587);
+	/* The name has to carry the host to connect to, and the answer says
+	   whether it did: without one there is nowhere to go, and what follows
+	   reads the name as if there were. */
+	if(parseconnusername((char *)username, param, 0, 587)) {RETURN(669);}
 	socksend(param, param->clisock, (unsigned char *)"334 UGFzc3dvcmQ6\r\n", 18,conf.timeouts[STRING_S]);	
 	i = sockgetlinebuf(param, CLIENT, buf, sizeof(buf) - 10, '\n', conf.timeouts[STRING_S]);
 	if(i < 2) {RETURN(665);}
@@ -184,7 +187,7 @@ void * smtppchild(struct clientparam* param) {
 	}
 	if(i < 3 || *username) {RETURN(668);}
 	username[i] = 0;
-	parseconnusername((char *)username+1, param, 0, 587);
+	if(parseconnusername((char *)username+1, param, 0, 587)) {RETURN(670);}
 	res = (int)strlen((char *)username+1) + 2;
 	if(res < i){
 		if(param->extpassword) free(param->extpassword);
@@ -237,14 +240,14 @@ void * smtppchild(struct clientparam* param) {
 		param->nwrites++;
 		i = sockgetlinebuf(param, SERVER, buf, sizeof(buf) - 1, '\n', conf.timeouts[STRING_L]);
 		if(i<4 || strncasecmp((char *)buf, "334", 3)) {RETURN(680);}
-		en64(param->extusername, buf, (int)strlen((char *)param->extusername));
+		if(!en64(param->extusername, buf, (int)strlen((char *)param->extusername), (int)sizeof(buf))) {RETURN(683);}
 		socksend(param, param->remsock, buf, (int)strlen((char *)buf), conf.timeouts[STRING_S]);
 		socksend(param, param->remsock, (unsigned char *)"\r\n", 2, conf.timeouts[STRING_S]);
  param->statscli64+=(i+2);
 		param->nwrites+=2;
 		i = sockgetlinebuf(param, SERVER, buf, sizeof(buf) - 1, '\n', conf.timeouts[STRING_L]);
 		if(i<4 || strncasecmp((char *)buf, "334", 3)) {RETURN(681);}
-		en64(param->extpassword, buf, (int)strlen((char *)param->extpassword));
+		if(!en64(param->extpassword, buf, (int)strlen((char *)param->extpassword), (int)sizeof(buf))) {RETURN(683);}
 		socksend(param, param->remsock, buf, (int)strlen((char *)buf), conf.timeouts[STRING_S]);
 		socksend(param, param->remsock, (unsigned char *)"\r\n", 2, conf.timeouts[STRING_S]);
  param->statscli64+=(i+2);
@@ -259,12 +262,12 @@ void * smtppchild(struct clientparam* param) {
 		*username = 0;
 		i = (int)strlen((char *)param->extusername) + 1;
 		res = (int)strlen((char *)param->extpassword);
-		if(i + 1 + res >= (int)sizeof(username) || ((i + 1 + res + 2) / 3) * 4 + 1 > (int)sizeof(buf)) {RETURN(683);}
+		if(i + 1 + res >= (int)sizeof(username)) {RETURN(683);}
 		memcpy(username+1, param->extusername,  i);
 		i++;
 		memcpy(username + i, param->extpassword, res);
 		i+=res;
-		en64(username, buf, i);
+		if(!en64(username, buf, i, (int)sizeof(buf))) {RETURN(683);}
 		i = (int)strlen((char *)buf);
 		socksend(param, param->remsock, buf, i, conf.timeouts[STRING_S]);
 		socksend(param, param->remsock, (unsigned char *)"\r\n", 2, conf.timeouts[STRING_S]);

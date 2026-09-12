@@ -13,6 +13,12 @@ void ssl_install(void);
 #ifdef WITH_PCRE
 void pcre_install(void);
 #endif
+#ifdef WITH_TRANSPARENT
+void transparent_install(void);
+#endif
+#ifdef WITH_HTTPSRV
+void httpsrv_init(void);
+#endif
 #ifndef _WIN32
 #include <sys/resource.h>
 #ifndef NOPLUGINS
@@ -28,7 +34,6 @@ void pcre_install(void);
 
 FILE * confopen();
 extern unsigned char *strings[];
-extern FILE *writable;
 extern struct counter_header cheader;
 extern struct counter_record crecord;
 
@@ -298,7 +303,7 @@ void cyclestep(void){
 					default:
 						break;
 				}
-				dologname (tmpbuf, conf.logname, (conf.archiver)?conf.archiver[1]:NULL, conf.logtype, (conf.logtime - t * conf.rotate));
+				dologname (tmpbuf, conf.logname, (conf.archiver)?conf.archiver[1]:NULL, conf.logtype, (conf.logtime - (time_t)t * conf.rotate));
 				remove ((char *) tmpbuf);
 				if(conf.archiver) {
 					int i;
@@ -530,6 +535,12 @@ int WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLine, int 
 #ifdef WITH_PCRE
   pcre_install();
 #endif
+#ifdef WITH_TRANSPARENT
+  transparent_install();
+#endif
+#ifdef WITH_HTTPSRV
+  httpsrv_init();
+#endif
 
   freeconf(&conf);
   initcommands();
@@ -537,7 +548,7 @@ int WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLine, int 
   conf.version++;
 
   if(res) RETURN(res);
-  if(!writable){fclose(fp); fp = NULL;}
+  fclose(fp); fp = NULL;
 
 #ifdef _WIN32
   

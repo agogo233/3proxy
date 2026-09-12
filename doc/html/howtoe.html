@@ -34,9 +34,11 @@
  <li><a href="#ISFTP">How to set up an FTP proxy</a></li>
  <li><a href="#TLSPR">How to set up an SNI proxy (tlspr)</a></li>
  <li><a href="#DNSPR">How to set up a DNS proxy (dnspr)</a></li>
+ <li><a href="#HTTPSRV">How to serve pages with the built-in HTTP server (httpsrv)</a></li>
  <li><a href="#SSLPLUGIN">How to set up TLS/SSL (https proxy, mTLS)</a></li>
  <li><a href="#CERTIFICATES">How to create CA and certificates for SSL</a></li>
  <li><a href="#PCRE">How to use PCRE filtering (regular expressions)</a></li>
+ <li><a href="#TRANSPARENT">How to proxy transparently</a></li>
  <li><A HREF="#AUTH">How to limit service access</a>
  <li><A HREF="#USERS">How to create a user list</a>
  <li><A HREF="#ACL">How to limit user access to resources</a>
@@ -727,6 +729,218 @@ nscache6 65536
 dnspr -p53 -F10.0.0.1
 </pre>
  </p>
+ <li><a name="HTTPSRV"><i>How to serve pages with the built-in HTTP server (httpsrv)</i></a>
+<p>
+httpsrv answers requests itself instead of forwarding them. What it does with a
+request is decided by <code>http</code> rules written before the service, the way
+access rules are: the first rule whose host and URL both match handles the
+request. It is useful for a status page, a small static site, a block page for
+requests an ACL rejects, or a health check an upstream balancer can poll.
+</p><pre>
+http OPERATION HOST URL [PARAMETERS]
+</pre>
+<p>
+HOST is matched against the Host header, URL against the path with the query
+string removed. A minimal static site:
+</p><pre>
+auth iponly
+allow *
+
+http file * /           /usr/local/web/index.html
+http file * /*.html     "/usr/local/web/$1.html"
+http file * /css/*.css  "/usr/local/web/css/$1.css"
+http cache * /img/**    "/usr/local/web/img/$1" * 3600
+httpsrv -p80 -i127.0.0.1
+</pre>
+<p>
+<b>Patterns.</b> <code>*</code> stands for any run of characters within one
+element of the path and does not cross a <code>/</code>, so a rule cannot reach
+into a directory it did not name. <code>**</code> crosses them. Each star, and
+each group of a regular expression, is remembered in order: <code>$1</code>
+upwards stand for them in the path or location the rule builds, and
+<code>$0</code> for the whole request path. A <code>rewrite_host</code> rule
+uses the stars of its own host pattern instead, since that is what it is
+rewriting. With a PCRE build a pattern may be
+written as a regular expression with a <code>pcre:</code> prefix, for the URL and
+for the host alike:
+</p><pre>
+http file  * /d/*.txt       "/usr/local/web/$1.txt"
+http cache * "pcre:^/(.*)/pic/(.*)\.(gif|jpeg)$" "/usr/local/web/picts/$1/$2.$3"
+http file  status.example.com /**  "/usr/local/web/status/$1"
+http file  "pcre:^(www|web)\.example\.com$" /**  "/usr/local/web/$1"
+</pre>
+<p>
+Outside quotes a dollar begins the name of a file to include, so an argument
+holding one - a path built with <code>$1</code>, a regular expression anchored
+with <code>$</code> - is written in quotes, as above. <code>$$</code> stands for
+a single dollar and is not read as an include either.
+</p>
+<p>
+<b>Operations.</b>
+</p><pre>
+&#35; file - send the file, using sendfile/TransmitFile where the system can
+http file * /dl/**  "/usr/local/web/dl/$1"
+
+&#35; cache - read it into memory on the first request and answer from there
+http cache * /css/*.css "/usr/local/web/css/$1.css"
+
+&#35; redir - answer with a redirect, 302 unless a status is given
+http redir * /old/**  301 "https://example.org/$1"
+
+&#35; rewrite - change the path and hand the request to the rules after this one
+http rewrite * /alias/** "/w/$1"
+
+&#35; rewrite_host - the same for the host, which decides which rules match next
+http rewrite_host *.old.example ** "$1.new.example"
+
+&#35; reply - a status and nothing else
+http reply * /health**  200 "X-Health: ok"
+http reply * /down**    503 "Retry-After: 30"
+
+&#35; echo, data - describe the request, or generate content of a given size
+http echo * /echo**
+http data * /gen** size=1048576
+</pre>
+<p>
+<b>What a rule adds to the answer.</b> <code>file</code> and <code>cache</code>
+take, after the path, a content type, a max-age, headers to add and a status to
+answer with. Each may be left out or written as <code>*</code>:
+</p><pre>
+http OPERATION HOST URL PATH [TYPE [MAX-AGE [HEADERS [CODE]]]]
+
+&#35; type worked out from the name, cached by clients for an hour
+http file * /img/*.png "/usr/local/web/img/$1.png" * 3600
+
+&#35; a type of its own, and a header
+http file * /api/*.json "/usr/local/web/api/$1.json" application/json * "X-Api: 1"
+
+&#35; a file serving as the body of an error page
+http file * /err/** /usr/local/web/404.html text/html * * 404
+</pre>
+<p>
+HEADERS is one argument holding whole header lines, separated by a backslash and
+an n - the two characters, since a configuration line cannot carry a line
+ending. Quote it, headers contain spaces. A rule's headers and max-age go with
+whatever status that rule asked for, but not with a refusal the server itself
+decided on: a request for a file which is not there is answered 404 by the
+server, not by the rule.
+</p>
+<p>
+Types not known to the server are registered with
+<code>http_content_type</code>, and a type named by a rule is used whatever the
+name of the file says:
+</p><pre>
+http_content_type .webp image/webp
+http_content_type wasm  application/wasm
+</pre>
+<p>
+<b>Files and dates.</b> Only a full path is taken - a relative one would be read
+against whatever directory the service happens to be in - and a path holding
+<code>.</code> or <code>..</code> as an element, a line ending or a star is
+refused. On Windows a path must name a drive or a share (<code>"C:\web\$1"</code>
+or <code>"\\host\share\$1"</code>). A request which decodes to a path leaving the
+tree is refused before any of this. Every answer carries Last-Modified, and a
+request carrying If-Modified-Since is answered 304 with no body when the file
+has not changed.
+</p>
+<p>
+<b>Caching.</b> <code>cache</code> reads the file once and answers from memory
+afterwards; a file which has changed on disk is read again, and one larger than
+a megabyte is sent as <code>file</code> would. With a MAX-AGE the file is not
+looked at again for that long - the rule has already told clients the file may
+be treated as unchanged for that time - so a request costs nothing but the copy
+out. Without one every request stats the file and a change is picked up at once.
+</p>
+<p>
+<b>A block page.</b> A service which rejects a request with a redirect can send
+the client to an httpsrv running beside it:
+</p><pre>
+auth iponly
+deny * * "pcre:^(ads|track)[0-9]*\.example\.(com|net)$"
+allow *
+proxy -p3128 -i192.168.1.1
+
+flush
+auth iponly
+allow *
+http file * /**  /usr/local/web/blocked.html text/html * * 403
+httpsrv -p8080 -i127.0.0.1
+</pre>
+<p>
+<b>Both a site and a proxy.</b> A request may arrive the way it arrives at a
+site - a path, with the name in the Host header - or the way it arrives at a
+proxy, naming the whole URL, or the host alone with CONNECT. Both are read. A
+proxy-form request authenticates with Proxy-Authorization and is refused with
+407, the way a proxy refuses one; a site-form request uses Authorization and
+401. What answers it is decided by the rules either way.
+</p>
+<p>
+<code>proxypass</code> is the rule which answers by fetching, so one service can
+serve what it has and proxy the rest:
+</p><pre>
+auth iponly
+allow *
+http file * /local/** "/usr/local/web/$1"
+http proxypass * /**
+httpsrv -p8080
+</pre>
+<p>
+An access rule redirecting to the local proxy does the same without a rule for
+it. The chain with no address is what "the local proxy" is written as, and the
+second <code>allow</code> is what the proxy matches on the pass it makes itself,
+since a rule carrying the chain is not taken twice:
+</p><pre>
+auth iponly
+allow *
+parent 1000 http 0.0.0.0 0
+allow *
+http file * /local/** "/usr/local/web/$1"
+httpsrv -p8080
+</pre>
+<p>
+Authentication happens twice for the same reason - once for the service, once
+for the proxy - so a configuration which asks for credentials asks for them the
+way a proxy does.
+</p>
+<p>
+The access rules are read from the top on both passes, and the second one is
+where the request's destination is known. On the first pass the service is
+answering for itself, so an address or a port in a rule is matched against the
+address the client connected to; the name from the request is matched on both
+passes. On the second the destination is the one the request names, so rules
+written with an address, a port or a name decide what the proxy may fetch, and
+they decide it before it connects:
+</p><pre>
+auth iponly
+allow *
+parent 1000 http 0.0.0.0 0
+allow * * * 80,443
+deny *
+httpsrv -p8080
+</pre>
+<p>
+Everything reaches the rules, only ports 80 and 443 are fetched, and a
+<code>deny</code> written before the rule carrying the chain applies on both
+passes just the same. The connection to the server is kept for the next request and
+closed when that request goes elsewhere, or when the server has closed it in the
+meantime.
+</p>
+<p>
+<b>Connections.</b> A client asking in HTTP/1.1 gets a 1.1 answer and the
+connection is kept for the next request, unless it sent
+<code>Connection: close</code>; a 1.0 client has to ask for keep-alive. The
+connection is only kept when the length of the answer is known exactly, which is
+true of every operation except the administration pages, so those are always the
+last thing on a connection. A request body the server cannot read to its end -
+one sent chunked, or one larger than a megabyte - ends the connection too.
+</p>
+<p>
+<b>Administration.</b> The <code>admin</code> service is httpsrv with the pages
+of the administration interface already declared, see
+<a href="#ADMIN">Administering and information analysis</a>. Rules may be added
+before it in the same way, and are taken first.
+</p>
+ </p>
  <li><a name="SSLPLUGIN"><i>How to set up TLS/SSL (https proxy, mTLS)</i></a>
 <p>
 Since version 0.9.7, SSL/TLS support is built into 3proxy when compiled with OpenSSL
@@ -828,11 +1042,31 @@ This creates an HTTPS proxy (ssl_serv) that accepts TLS connections from clients
 &#35; Generate CA private key
 openssl genrsa -out ca.key 4096
 
+&#35; Extensions that make the certificate usable as a CA
+cat > ca.ext << 'EOF'
+basicConstraints=critical,CA:TRUE
+keyUsage=critical,keyCertSign,cRLSign
+subjectKeyIdentifier=hash
+EOF
+
 &#35; Generate CA certificate (valid for 10 years)
-openssl req -x509 -new -nodes -key ca.key -sha256 -days 3650 \
+openssl req -new -nodes -key ca.key \
     -subj "/C=US/ST=State/L=City/O=MyOrg/CN=My CA" \
-    -out ca.crt
+    -out ca.csr
+openssl x509 -req -in ca.csr -signkey ca.key -sha256 -days 3650 \
+    -extfile ca.ext -out ca.crt
 </pre>
+<p>
+The extensions are not optional. Without <b>basicConstraints=CA:TRUE</b> and
+<b>keyCertSign</b> the certificate is not accepted as a CA, and clients report
+that they cannot get the local issuer certificate. <b>subjectKeyIdentifier</b>
+is what certificates signed by this CA point back at.
+</p>
+<p>
+They are given in a file rather than with <b>-addext</b> because LibreSSL, the
+<b>openssl</b> command on macOS and some BSDs, does not apply -addext the same
+way OpenSSL does. The form above behaves the same on both.
+</p>
 <p>
 For MITM, import ca.crt into client browsers/OS as a trusted root CA.
 </p>
@@ -866,7 +1100,17 @@ EOF
 openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key \
     -CAcreateserial -out server.crt -days 365 -sha256 \
     -extfile server.ext
+
+&#35; Check it the way a current client will
+openssl verify -x509_strict -CAfile ca.crt server.crt
 </pre>
+<p>
+Verify strictly, because that is what the client does. OpenSSL 3 adds the
+subject and authority key identifiers when it signs and LibreSSL does not,
+which is why the extensions file asks for them by name. Python has verified
+strictly since 3.13 and refuses a certificate carrying no
+<b>authorityKeyIdentifier</b>; other clients are moving the same way.
+</p>
 <p>
 For a public https:// proxy, use a CA like Let's Encrypt instead of self-signed.
 </p>
@@ -886,6 +1130,8 @@ cat > client.ext << 'EOF'
 basicConstraints=CA:FALSE
 keyUsage = digitalSignature, nonRepudiation, keyEncipherment
 extendedKeyUsage = clientAuth
+subjectKeyIdentifier=hash
+authorityKeyIdentifier=keyid,issuer
 EOF
 
 &#35; Sign with CA
@@ -908,8 +1154,14 @@ Import client1.p12 into the client browser or OS certificate store.
 
 &#35; CA
 openssl genrsa -out ca.key 4096
-openssl req -x509 -new -nodes -key ca.key -sha256 -days 3650 \
-    -subj "/CN=3proxy CA" -out ca.crt
+cat > ca.ext << 'EOF'
+basicConstraints=critical,CA:TRUE
+keyUsage=critical,keyCertSign,cRLSign
+subjectKeyIdentifier=hash
+EOF
+openssl req -new -nodes -key ca.key -subj "/CN=3proxy CA" -out ca.csr
+openssl x509 -req -in ca.csr -signkey ca.key -sha256 -days 3650 \
+    -extfile ca.ext -out ca.crt
 
 &#35; Server
 openssl genrsa -out server.key 2048
@@ -919,6 +1171,8 @@ basicConstraints=CA:FALSE
 keyUsage = keyEncipherment
 extendedKeyUsage = serverAuth
 subjectAltName = DNS:localhost,DNS:proxy,IP:127.0.0.1
+subjectKeyIdentifier=hash
+authorityKeyIdentifier=keyid,issuer
 EOF
 openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key \
     -CAcreateserial -out server.crt -days 365 -sha256 -extfile server.ext
@@ -929,12 +1183,201 @@ openssl req -new -key client.key -subj "/CN=client" -out client.csr
 cat > client.ext << 'EOF'
 basicConstraints=CA:FALSE
 extendedKeyUsage = clientAuth
+subjectKeyIdentifier=hash
+authorityKeyIdentifier=keyid,issuer
 EOF
 openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key \
     -CAcreateserial -out client.crt -days 365 -sha256 -extfile client.ext
 openssl pkcs12 -export -out client.p12 -passout pass: \
     -inkey client.key -in client.crt -certfile ca.crt
+
+&#35; Both must pass the checks a current client applies
+openssl verify -x509_strict -CAfile ca.crt server.crt
+openssl verify -x509_strict -CAfile ca.crt client.crt
 </pre>
+
+ <li><a name="TRANSPARENT"><i>How to proxy transparently</i></a>
+<p>
+A transparent proxy serves clients that were never configured to use one. A
+packet filter redirects their connections to 3proxy, and the
+<b>transparent</b> command tells the service to take the destination from the
+filter instead of from the request. Every other feature applies as usual:
+access rules, parent proxies, limits and logging all see the real destination.
+It works on Linux and on the BSDs. Since 1.0.1 it is part of the binary; before
+that it was the separate TransparentPlugin, and the <b>plugin</b> line it
+needed is no longer required.
+</p>
+<p>
+The command supplies both the address and the port the client was trying to
+reach, so a service can serve whatever was redirected to it rather than one
+port with one target.
+</p>
+<p>
+Without it a service has to get a destination from somewhere else: an HTTP
+proxy falls back to the <b>Host</b> header, and a port mapper uses the address
+it was configured with. Taking the destination from the filter is what makes
+the other protocols work, and what makes the address authoritative rather than
+something the client claimed.
+</p>
+<p>
+<b>tlspr</b> is the clearest case. Nothing reaches it at all unless traffic is
+redirected to it, or the clients resolve the names to it through DNS. With a
+redirection it gets the address as well as the name from the handshake, and
+that is what lets access rules be written with host names: the name from the
+handshake is matched, and the connection still goes to the address the client
+was going to. Without the address it would have to resolve the name itself,
+which is a second lookup and a second answer.
+</p>
+<p>
+A configuration for web and TLS traffic:
+</p><pre>
+log /var/log/3proxy.log D
+auth iponly
+allow *
+
+&#35; the destination comes from the redirection for the services below
+transparent
+
+&#35; ordinary web traffic, redirected here from port 80
+proxy -p3129 -e192.0.2.10
+
+&#35; TLS, redirected here from port 443: tlspr would otherwise have only the
+&#35; name in the handshake, and this gives it the address as well
+tlspr -p3143 -e192.0.2.10
+
+notransparent
+</pre>
+<p>
+<b>-e</b> gives those services an address of their own to connect from. That
+address is what the redirection rules exclude, and excluding it is what stops
+the proxy's own connections from being redirected back into it. Without an
+exclusion the connection 3proxy makes to the origin matches the same rule,
+returns to 3proxy, and the traffic goes round until something gives out.
+Running 3proxy as its own account and excluding that account works too, and is
+the better choice when the machine has one address.
+</p>
+
+<p><b>Linux, iptables</b>. For traffic the machine forwards for others:
+</p><pre>
+iptables -t nat -A PREROUTING -i eth0 -p tcp --dport 80  -j REDIRECT --to-ports 3129
+iptables -t nat -A PREROUTING -i eth0 -p tcp --dport 443 -j REDIRECT --to-ports 3143
+</pre>
+<p>
+Traffic the machine generates itself passes through OUTPUT instead, where the
+proxy's own connections have to be excluded:
+</p><pre>
+&#35; by the address the services connect from
+iptables -t nat -A OUTPUT -p tcp --dport 80 ! -s 192.0.2.10 -j REDIRECT --to-ports 3129
+
+&#35; or by the account 3proxy runs as
+iptables -t nat -A OUTPUT -p tcp --dport 80 -m owner ! --uid-owner proxy3 \
+    -j REDIRECT --to-ports 3129
+</pre>
+
+<p><b>Linux, nftables</b> (Debian 11+, Ubuntu 22.04+, RHEL 8+, Fedora, Arch,
+where nftables is what iptables is a front end for):
+</p><pre>
+table ip proxy3 {
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+		iif "eth0" tcp dport 80 redirect to :3129
+		iif "eth0" tcp dport 443 redirect to :3143
+	}
+
+	chain output {
+		type nat hook output priority dstnat; policy accept;
+		meta skuid != "proxy3" tcp dport 80 redirect to :3129
+		meta skuid != "proxy3" tcp dport 443 redirect to :3143
+	}
+}
+</pre>
+<p>
+Load it with <b>nft -f</b>, and keep it across reboots in
+<b>/etc/nftables.conf</b> (Debian, Ubuntu) or
+<b>/etc/sysconfig/nftables.conf</b> (RHEL, Fedora). A table name cannot begin
+with a digit, which is why the table above is not called 3proxy.
+</p>
+
+<p><b>Linux, firewalld</b> (RHEL, CentOS Stream, Fedora, openSUSE). Redirect an
+incoming port on a zone:
+</p><pre>
+firewall-cmd --permanent --zone=internal --add-forward-port=port=80:proto=tcp:toport=3129
+firewall-cmd --permanent --zone=internal --add-forward-port=port=443:proto=tcp:toport=3143
+firewall-cmd --reload
+</pre>
+<p>
+firewalld has no exclusion for the proxy's own traffic in that form, so put
+that part in a direct rule:
+</p><pre>
+firewall-cmd --permanent --direct --add-rule ipv4 nat OUTPUT 0 \
+    -p tcp --dport 80 -m owner ! --uid-owner proxy3 -j REDIRECT --to-ports 3129
+firewall-cmd --reload
+</pre>
+
+<p><b>Linux, ufw</b> (Ubuntu, Debian). ufw has no command for redirection;
+add the rules to <b>/etc/ufw/before.rules</b>, above the <b>*filter</b> block:
+</p><pre>
+*nat
+:PREROUTING ACCEPT [0:0]
+-A PREROUTING -i eth0 -p tcp --dport 80 -j REDIRECT --to-ports 3129
+-A PREROUTING -i eth0 -p tcp --dport 443 -j REDIRECT --to-ports 3143
+COMMIT
+</pre>
+
+<p>
+On Linux 3proxy asks the kernel where the connection was going. On the BSDs it
+asks pf, which keeps the original destination in its state table, through
+<b>/dev/pf</b> - so <b>rdr</b> rules work, and 3proxy has to be able to read
+that device. Where a redirection leaves the destination on the socket instead,
+that is used: OpenBSD <b>divert-to</b> and FreeBSD <b>ipfw fwd</b> both do.
+</p>
+<p>
+The mechanism is chosen automatically, and <b>transparent</b> takes an
+argument for the installations that need to pin it: <b>auto</b> (the default),
+<b>netfilter</b>, <b>pf</b>, or <b>socket</b> for reading it off the socket. A
+mode the build has no code for is refused, so a configuration written for
+another platform fails where it is wrong instead of quietly doing something
+else.
+</p>
+
+<p><b>FreeBSD, NetBSD and OpenBSD, pf</b>. Redirect in <b>/etc/pf.conf</b>,
+excluding the address the proxy connects from:
+</p><pre>
+rdr pass on em0 inet proto tcp from ! 192.0.2.10 to any port 80  -&gt; 127.0.0.1 port 3129
+rdr pass on em0 inet proto tcp from ! 192.0.2.10 to any port 443 -&gt; 127.0.0.1 port 3143
+</pre>
+<p>
+Load with <b>pfctl -f /etc/pf.conf</b>. 3proxy looks the destination up in pf's
+state table, so it needs to read <b>/dev/pf</b>: either run it as root, or give
+its account access to that device.
+</p>
+
+<p><b>OpenBSD, divert-to</b> is an alternative which leaves the destination on
+the socket, and needs no access to <b>/dev/pf</b>:
+</p><pre>
+pass in on em0 inet proto tcp to any port 80  divert-to 127.0.0.1 port 3129
+pass in on em0 inet proto tcp to any port 443 divert-to 127.0.0.1 port 3143
+</pre>
+
+<p><b>FreeBSD, ipfw</b>. <b>fwd</b> delivers the connection locally without
+rewriting it, which also leaves the destination on the socket:
+</p><pre>
+ipfw add fwd 127.0.0.1,3129 tcp from any to any 80  in recv em0
+ipfw add fwd 127.0.0.1,3143 tcp from any to any 443 in recv em0
+</pre>
+
+<p><b>macOS</b> has <b>/dev/pf</b> but ships no header for it, so a macOS build
+has no pf lookup, and macOS has neither <b>divert-to</b> nor ipfw to leave the
+address on the socket. Transparent proxying is not usable there, even though
+the commands exist in a macOS build.
+</p>
+
+<p>
+Check the result by asking for a host through a redirected port and reading
+the log: the request should appear with the address the client asked for,
+which is what it would look like through a configured proxy.
+</p>
+
  <li><a name="PCRE"><i>How to use PCRE filtering (regular expressions)</i></a>
 <p>
 Since version 0.9.7, PCRE (Perl Compatible Regular Expressions) filtering is built into
@@ -993,6 +1436,34 @@ pcre_extend deny * 192.168.0.1/16
 <p>
 <b>Note:</b> Regular expressions don't require authentication and cannot replace
 authentication and/or allow/deny ACLs.
+</p>
+<p>
+<b>Regular expressions in host names:</b> a host name in the target list of an
+access rule may be written as a regular expression instead of a wildmask, by
+giving it a <code>pcre:</code> prefix (<code>regex:</code> means the same). This
+needs a build with PCRE support, the same as the <code>pcre</code> commands
+above.
+</p><pre>
+&#35; Wildmask: a name may only be matched at its beginning and its end
+deny * * *ads.example.com
+
+&#35; Regular expression: anything PCRE can express
+deny * * "pcre:^(ads|track)[0-9]*\.example\.(com|net)$"
+allow * * "pcre:^(www|api)\.example\.com$"
+</pre>
+<p>
+The name is lowercased and trailing dots are removed before the pattern is
+matched, so write patterns in lower case. Quote a pattern which ends in
+<code>$</code>, or write it as <code>$$</code>: outside quotes a lone dollar
+begins the name of a file to include. Only the target list takes names - the
+source list is addresses - and the name is only checked when the request
+carries one. A wildmask is cheaper and is enough for most rules; a regular
+expression is matched per request.
+</p>
+<p>
+The same prefix and the same patterns are used by the <code>http</code> command
+of the built-in HTTP server, for the host a rule answers for and for the URL it
+matches.
 </p>
  <li><A NAME="AUTH">How to limit service access</a>
 <p>
@@ -1338,6 +1809,82 @@ the second hop is 192.168.20.1, and the 3rd one is either 192.168.30.1 with a pr
 of 30% or 192.168.40.1 with a probability of 70%.
 </p>
 
+ <li><a name="UDPACL">How to apply ACLs to UDP traffic</a>
+<p>
+A SOCKSv5 UDP ASSOCIATE request only asks 3proxy to open a relay port, it
+carries no destination. The destination is taken from every datagram the client
+sends afterwards, so a single association may reach any number of destinations.
+3proxy authorizes the destination of every datagram, so ACLs limiting the
+destination address, host name or port do apply to UDP traffic.
+</p>
+<p>
+Differences from TCP:
+</p>
+<ul>
+<li>A datagram to a denied destination is dropped, the association is not
+terminated.
+<li>The parent proxy and the external address are selected for the destination
+of the datagram and not for the ASSOCIATE request, and are re-established if a
+later destination selects another ACL entry. Only <code>socks5</code> and
+<code>socks5+</code> parents can be used for UDP.
+<li>ACLs are checked for the datagrams sent by the client only. A datagram
+received on the association is relayed to the client without an ACL check: with
+a parent proxy only the datagrams from the parent are accepted, an association
+without a parent accepts a datagram from any source. The source reported to the
+client is the actual source of the datagram. The address in the log record is the destination the
+client sent the datagrams to, the source of the received datagrams is not
+logged.
+<li>A client may use a single association to reach many destinations. An ACL
+entry which limits the destination silently drops the datagrams to every other
+destination, so limiting the destination of UDP traffic can break such clients
+in a way which is hard to diagnose. Limit it only when it is really required.
+<li>Bandwidth limiters and traffic counters which limit the destination are
+selected when the destination is authorized, so they are selected for the
+destination of the first datagram and are not re-selected for every following
+destination. They can not be applied per destination to incoming UDP traffic at
+all.
+<li>Every change of the destination host name, address or port is authorized
+again and logged. Use <code>nscache</code> for host names and the
+authentication cache for anything more expensive than 'iponly'. The
+<code>-U</code> option of the <code>socks</code> service turns the logging
+and/or the re-authorization off; with <code>-U0</code> or <code>-U1</code>
+only the first destination of an association is authorized.
+</ul>
+<p>
+Limit the destinations a client may send datagrams to:
+</p><pre>
+auth iponly
+allow * * 8.8.8.8 53
+deny *
+socks -p1080
+</pre>
+<p>
+The ASSOCIATE request succeeds, datagrams to 8.8.8.8:53 are relayed, datagrams
+to any other destination are dropped.
+</p>
+<p>
+The same with 'strong' (or RADIUS, or plugin) authentication, where every new
+destination would otherwise be authenticated again:
+</p><pre>
+users user1:CL:password
+authcache user,pass,dstaddr,dstport 60
+auth cacheacl strong
+allow user1 * 8.8.8.8 53
+deny *
+socks -p1080
+</pre>
+<p>
+With 'cacheacl' the ACL result is not re-evaluated on a cache hit, so every
+field the ACL limits must be a part of the cache key: 'user' and 'pass' for the
+userlist, 'dstaddr' and 'dstport' for the targetlist and the targetportlist,
+'ip' for the sourcelist, 'dsthost' for host names in the targetlist, 'dstoper'
+for the operationlist. Without the destination in the key the result cached for
+one destination is applied to any other destination and the destination is not
+checked at all. Use plain 'cache' instead of 'cacheacl' if ACLs may change
+during the cache lifetime, or if a parent proxy is used: on a 'cacheacl' hit
+the ACL is not walked, so no parent proxy is selected and datagrams are sent
+directly.
+</p>
  <li><A NAME="BANDLIM">How to limit bandwidth</a>
 <p>
 3proxy supports bandwidth filters. Use the bandlimin/bandlimout and
