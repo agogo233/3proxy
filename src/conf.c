@@ -38,14 +38,18 @@ _3proxy_mutex_t bandlim_mutex;
 _3proxy_mutex_t connlim_mutex;
 _3proxy_mutex_t tc_mutex;
 _3proxy_mutex_t config_mutex;
+int runningservices = 0;
+_3proxy_mutex_t runningservices_mutex;
+_3proxy_sem_t serviceexited;
 
-int haveerror = 0;
 int linenum = 0;
 
 struct counter_header cheader = {"3CF", (time_t)0};
 struct counter_record crecord;
 
-int mainfunc (int argc, char** argv);
+int mainprepare(int argc, char** argv, void **service);
+int mainrun(void *service);
+void maindrop(void *service);
 
 struct proxydef childdef = {NULL, 0, 0, S_NOSERVICE, ""};
 
@@ -75,8 +79,12 @@ DWORD WINAPI startsrv(LPVOID data) {
 #else
 void * startsrv(void * data) {
 #endif
-  struct child *d = (struct child *)data;
-  mainfunc(d->argc, (char **)d->argv);
+  /* counted by start_proxy_thread() before the thread is created */
+  mainrun(data);
+  _3proxy_mutex_lock(&runningservices_mutex);
+  runningservices--;
+  _3proxy_mutex_unlock(&runningservices_mutex);
+  _3proxy_sem_unlock(serviceexited);
   return 0;
 }
 
@@ -142,36 +150,45 @@ unsigned char * dologname (unsigned char *buf, unsigned char *name, const unsign
 	return buf;
 }
 
+/* The service is set up here, in the thread reading the configuration, so
+   an error in its options stops the configuration; its own thread then
+   listens and serves. */
 int start_proxy_thread(struct child * chp){
   pthread_t thread;
+  void *service;
+  int res;
 #ifdef _WIN32
   HANDLE h;
 #endif
 
-	_3proxy_sem_lock(conf.threadinit);
+	if((res = mainprepare(chp->argc, (char **)chp->argv, &service))) {
+		fprintf(stderr, "Service not started on line: %d%s\n", linenum, res == 2? ": insufficient memory":"");
+		return(40);
+	}
+	_3proxy_mutex_lock(&runningservices_mutex);
+	runningservices++;
+	_3proxy_mutex_unlock(&runningservices_mutex);
 #ifdef _WIN32
 #ifndef _WINCE
-	h = (HANDLE)_beginthreadex((LPSECURITY_ATTRIBUTES )NULL, 16384+conf.stacksize, (void *)startsrv, (void *) chp, (DWORD)0, &thread);
+	h = (HANDLE)_beginthreadex((LPSECURITY_ATTRIBUTES )NULL, 16384+conf.stacksize, (void *)startsrv, service, (DWORD)0, &thread);
 #else
-	h = (HANDLE)CreateThread((LPSECURITY_ATTRIBUTES )NULL, 16384+conf.stacksize, (void *)startsrv, (void *) chp, (DWORD)0, &thread);
+	h = (HANDLE)CreateThread((LPSECURITY_ATTRIBUTES )NULL, 16384+conf.stacksize, (void *)startsrv, service, (DWORD)0, &thread);
 #endif
 	if(h)CloseHandle(h);
+	else {
 #else
 	pthread_attr_init(&pa);
 	pthread_attr_setstacksize(&pa,threadstacksize(conf.stacksize));
 	pthread_attr_setdetachstate(&pa,PTHREAD_CREATE_DETACHED);
-	if(pthread_create(&thread, &pa, startsrv, (void *)chp)){
-		pthread_attr_destroy(&pa);
-		fprintf(stderr, "Failed to create service thread on line %d, try to set larger stacksize\n", linenum);
-		_3proxy_sem_unlock(conf.threadinit);
-		return(40);
-	}
+	res = pthread_create(&thread, &pa, startsrv, service);
 	pthread_attr_destroy(&pa);
+	if(res){
 #endif
-	_3proxy_sem_lock(conf.threadinit);
-	_3proxy_sem_unlock(conf.threadinit);
-	if(haveerror)  {
-		fprintf(stderr, "Service not started on line: %d%s\n", linenum, haveerror == 2? ": insufficient memory":"");
+		_3proxy_mutex_lock(&runningservices_mutex);
+		runningservices--;
+		_3proxy_mutex_unlock(&runningservices_mutex);
+		maindrop(service);
+		fprintf(stderr, "Failed to create service thread on line %d, try to set larger stacksize\n", linenum);
 		return(40);
 	}
 	return 0;
@@ -187,6 +204,9 @@ static int h_proxy(int argc, unsigned char ** argv){
 		childdef.port = 3128;
 		childdef.isudp = 0;
 		childdef.service = S_PROXY;
+#ifdef WITH_FTP
+		childdef.helpmessage = " -Xftp - fetch ftp:// URLs\n";
+#endif
 #ifdef NOIPV6
 		if(!resolvfunc || (resolvfunc == myresolver && !dns_table.poolsize)){
 			fprintf(stderr, "[line %d] Warning: no nserver/nscache configured, proxy may run very slow\n", linenum);
@@ -358,7 +378,8 @@ static int h_log(int argc, unsigned char ** argv){
 #ifndef _WIN32
 			conf.logfunc = logsyslog;
 			if(notchanged) return 0;
-			openlog((char *)conf.logtarget+1, LOG_PID, LOG_DAEMON);
+			/* connected now: after a chroot there is no /dev/log to find */
+			openlog((char *)conf.logtarget+1, LOG_PID | LOG_NDELAY, LOG_DAEMON);
 #endif
 		}
 #ifdef WITH_ODBC
@@ -903,6 +924,82 @@ static int parserange(unsigned char *arg, uint32_t *range)
 	return 0;
 }
 
+/* Scan a parent weight into its share of WEIGHTSCALE, as an integer: there is
+ * no floating point anywhere near a configuration file.
+ *
+ * A weight starting with 0 or . is a fraction of one, so .333 and 0.333 are
+ * both a third. Anything else is the old notation, thousandths, where 1000 is
+ * the whole share, and it may now carry more digits after a dot: 123.456 means
+ * the same as .123456. Either way at most 9 digits are kept, which is the
+ * resolution weights are held at.
+ *
+ * 1 followed by a point and nothing but zeroes is the one weight read as it
+ * looks rather than as thousandths: 1.0 is the whole share, where a bare 1 is
+ * a thousandth of it.
+ *
+ * A weight may also be written as a percentage, which is what a trailing %
+ * makes it: 50.5% is .505 is 505.
+ */
+static int parseweight(unsigned char * s, unsigned * weight){
+  static const unsigned pow10[10] = {1, 10, 100, 1000, 10000, 100000,
+				     1000000, 10000000, 100000000, 1000000000};
+  unsigned char *p, *end;
+  uint64_t val = 0, res;
+  int ndigits = 0, atpoint = -1, after, percent = 0, fraction;
+
+	if(!s || !*s) return 1;
+	end = s + strlen((char *)s);
+	if(end[-1] == '%'){
+		percent = 1;
+		if(--end == s) return 1;
+	}
+	/* 1.0, with as many zeroes after it as anyone cares to write, is the one
+	   weight read as it looks rather than as thousandths: the whole share,
+	   where a bare 1 is a thousandth of it */
+	if(!percent && s[0] == '1' && s[1] == '.' && s[2]){
+		for(p = s + 2; *p == '0'; p++);
+		if(!*p){
+			*weight = WEIGHTSCALE;
+			return 0;
+		}
+	}
+	fraction = (*s == '.' || *s == '0');
+	for(p = s; p < end; p++){
+		if(*p == '.'){
+			if(atpoint >= 0) return 1;
+			atpoint = ndigits;
+			continue;
+		}
+		if(*p < '0' || *p > '9') return 1;
+		if(ndigits == 18) return 1;
+		val = (val * 10) + (unsigned)(*p - '0');
+		ndigits++;
+	}
+	if(!ndigits || val > WEIGHTSCALE) return 1;
+	after = (atpoint < 0)? 0 : ndigits - atpoint;
+	if(percent){
+		/* a hundredth of the whole share for every 1% */
+		if(after > 7) return 1;
+		res = val * pow10[7 - after];
+	}
+	else if(fraction){
+		/* the digits before the point are the leading zero and add
+		   nothing, so only the ones after it say what the share is */
+		if(atpoint < 0) return val? 1 : (*weight = 0, 0);
+		if(after > 9) return 1;
+		res = val * pow10[9 - after];
+	}
+	else {
+		/* thousandths, with the digits after the point carrying on
+		   from them: three digits of a whole share, six more after */
+		if(after > 6) return 1;
+		res = val * pow10[6 - after];
+	}
+	if(res > WEIGHTSCALE) return 1;
+	*weight = (unsigned)res;
+	return 0;
+}
+
 static int h_parent(int argc, unsigned char **argv){
   struct ace *acl = NULL;
   struct chain *chains;
@@ -922,9 +1019,10 @@ static int h_parent(int argc, unsigned char **argv){
 		return(21);
 	}
 	memset(chains, 0, sizeof(struct chain));
-	chains->weight = (unsigned)atoi((char *)argv[1]);
-	if(chains->weight == 0 || chains->weight >1000) {
-		fprintf(stderr, "Chaining error: bad chain weight %u line %d\n", chains->weight, linenum);
+	/* 0 is the fallback weight: such a parent is only used once every
+	   weighted parent of its group has failed */
+	if(parseweight(argv[1], &chains->weight)) {
+		fprintf(stderr, "Chaining error: bad chain weight %s line %d\n", argv[1], linenum);
 		free(chains);
 		return(3);
 	}
@@ -1497,7 +1595,7 @@ static int h_ace(int argc, unsigned char **argv){
 			return 5;
 		}
 		*SAPORT(&acl->chains->addr) = htons((uint16_t)atoi((char *)argv[2]));
-		acl->chains->weight = 1000;
+		acl->chains->weight = WEIGHTSCALE;
 	case ALLOW:
 	case DENY:
 		if(!conf.acl){
@@ -1824,6 +1922,14 @@ static int h_setgid(int argc, unsigned char **argv){
 }
 
 
+/* What the C library reads on first use from files a chroot hides, read
+   while they can still be found: the time zone, without which every time
+   is UTC. Names looked up through the system cannot be helped this way, the
+   hosts file and resolv.conf are read again for lookups to come. */
+static void prechroot(void){
+	tzset();
+}
+
 static int h_chroot(int argc, unsigned char **argv){
 	uid_t uid = 0;
 	gid_t gid = 0;
@@ -1843,6 +1949,8 @@ static int h_chroot(int argc, unsigned char **argv){
         }
 	if(!chrootp){
 		char *p;
+
+		prechroot();
 		if(chroot((char *)argv[1])) {
 			fprintf(stderr, "Unable to chroot %s", argv[1]);
 			return(1);

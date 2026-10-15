@@ -47,6 +47,7 @@ typedef struct _3proxy_sem_s {
 	pthread_cond_t cond;
 	unsigned count;
 	unsigned maxcount;
+	int monotonic;		/* timed waits measured on CLOCK_MONOTONIC */
 } _3proxy_sem_t;
 #else
 #include <winsock2.h>
@@ -62,6 +63,13 @@ typedef struct _3proxy_sem_s {
 #endif
 #endif
 #define MAXBANDLIMS 10
+#define MAXFAILEDPARENTS 16
+/* Parent weights are kept as a share of WEIGHTSCALE, which is what the
+   weights of a group add up to. WEIGHTFUZZ is how far short of it a group may
+   fall and still be taken for a whole one, a thousandth of the share: three
+   weights of 333, or of .333333333, otherwise leave a remainder. */
+#define WEIGHTSCALE 1000000000u
+#define WEIGHTFUZZ 1000000u
 
 #ifdef WITH_POLL
 #include <poll.h>
@@ -336,7 +344,7 @@ struct chain {
 	unsigned char * exthost;
 	unsigned char * extuser;
 	unsigned char * extpass;
-	unsigned short weight;
+	unsigned weight;
 	unsigned short cidr;
 	/* local port range for extport/intport, first in the low half */
 	uint32_t range;
@@ -521,6 +529,14 @@ struct filterp {
 
 #define MAX_FILTERS 16
 
+/* Socket options for one kind of socket, -oc and the like: which of
+   sockopts[] are given, by their index there, and the value of each. */
+#define MAXSOCKOPTS 32
+struct sockoptset {
+	unsigned set;
+	int value[MAXSOCKOPTS];
+};
+
 
 struct sockfuncs {
 	void * state;
@@ -605,12 +621,13 @@ struct srvparam {
 	int stacksize;
 	int noforce;
 	int anonymous;
-	int clisockopts, srvsockopts, lissockopts, cbcsockopts, cbssockopts;
+	struct sockoptset clisockopts, srvsockopts, lissockopts, cbcsockopts, cbssockopts;
 	int gracetraf, gracenum, gracedelay;
 	int requirecert;
 	int haproxy;
 	int nostarttls;
 	PROXYSERVICE srvstarttls;
+	int allowftp;		/* the http proxy fetches ftp:// for this service */
 	uint32_t fakeip;
 	unsigned char fakeip6[16];
 #ifdef WITHSPLICE
@@ -627,6 +644,7 @@ struct srvparam {
 #endif
 	PROXYSOCKADDRTYPE extsa;
 	_3proxy_mutex_t counter_mutex;
+	_3proxy_sem_t childslots;	/* maxchild of them, one held by each child */
 	struct pollfd fds;
 	FILE *stdlog;
 	unsigned char * target;
@@ -725,6 +743,11 @@ struct clientparam {
 			*clibuf,
 			*srvbuf;
 
+	/* splice() pipes for the client's and the server's data, -1 until
+	   made; kept for the life of the connection */
+	int	pipecli[2],
+		pipesrv[2];
+
 	unsigned 	cliinbuf,
 			srvinbuf,
 			clioffset,
@@ -759,6 +782,15 @@ struct clientparam {
 	   that a plugin built against an older header still finds the fields it
 	   knows where they were. */
 	int onerequest;
+	/* A STARTTLS protocol to speak before the session is wrapped, set for
+	   one connection rather than for the service, which is how a redirect
+	   and a service name standing in for a mail proxy reach tlspr. */
+	PROXYSERVICE starttls;
+	/* Parents which failed for this connection. A retry picks another
+	   member of the group instead of the same one again, and a zero weight
+	   member is only reached once every weighted one is in here. */
+	struct chain *failedparents[MAXFAILEDPARENTS];
+	int nfailedparents;
 };
 
 struct filemon {
@@ -769,7 +801,6 @@ struct filemon {
 
 
 struct extparam {
-	_3proxy_sem_t threadinit;
 	int *timeouts;
 	struct ace * acl;
 #ifdef WITH_HTTPSRV

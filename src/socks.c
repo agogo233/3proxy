@@ -184,7 +184,8 @@ void * sockschild(struct clientparam* param) {
 	 param->operation = command == 2?BIND:UDPASSOC;
 	 if(command == 2){
 		if ((param->remsock=param->srv->so._socket(param->sostate, SASOCK(&param->req), SOCK_STREAM, IPPROTO_TCP)) == INVALID_SOCKET) {RETURN (11);}
-		setopts(param->remsock, param->srv->lissockopts);
+		setopts(param->remsock, &param->srv->lissockopts);
+		if(extbindtodevice(param, param->remsock)) {RETURN (12);}
 	 }
 	 break;
 
@@ -244,6 +245,7 @@ fflush(stderr);
 #else
 		fcntl(param->clisock, F_SETFL, O_NONBLOCK | fcntl(param->clisock, F_GETFL));
 #endif
+		if(intbindtodevice(param, param->clisock)) {RETURN (12);}
 		sin = param->sincl;
 		*SAPORT(&sin) = 0;
 		/* the port the client is told to send its datagrams to */
@@ -270,12 +272,17 @@ CLEANRET:
 	int repcode;
 
 	sasize = sizeof(sin);
-	if(command != 3 && param->remsock != INVALID_SOCKET) param->srv->so._getsockname(param->sostate, param->remsock, (struct sockaddr *)&sin,  &sasize);
-	if(command != 3 && !SAISNULL(&param->srv->extNat)){
-	    uint16_t port;
-	    port = *SAPORT(&sin);
-	    sin = param->srv->extNat;
-	    *SAPORT(&sin) = port;
+	/* CONNECT and BIND report the address of the socket towards the
+	   destination, UDP ASSOCIATE the one the client sends its datagrams
+	   to, as does a request which never got a socket of its own */
+	if(command != 3 && param->remsock != INVALID_SOCKET){
+	    param->srv->so._getsockname(param->sostate, param->remsock, (struct sockaddr *)&sin,  &sasize);
+	    if(!SAISNULL(&param->srv->extNat)){
+		uint16_t port;
+		port = *SAPORT(&sin);
+		sin = param->srv->extNat;
+		*SAPORT(&sin) = port;
+	    }
 	}
 	else {
 	    param->srv->so._getsockname(param->sostate, param->clisock, (struct sockaddr *)&sin,  &sasize);

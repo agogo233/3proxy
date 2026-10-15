@@ -1,5 +1,5 @@
 Name:           3proxy
-Version:        1.0.0
+Version:        1.0.1
 Release:        1%{?dist}
 Summary:        3proxy tiny proxy server
 License:        GPL/LGPL/Apache/BSD
@@ -36,11 +36,7 @@ make clean
 %files
 /bin/3proxy
 /bin/3proxy_crypt
-/bin/3proxy_ftppr
-/bin/3proxy_imapp
-/bin/3proxy_pop3p
 /bin/3proxy_proxy
-/bin/3proxy_smtpp
 /bin/3proxy_socks
 /bin/3proxy_tcppm
 /bin/3proxy_tlspr

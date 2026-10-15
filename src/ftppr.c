@@ -8,6 +8,8 @@
 
 #include "proxy.h"
 
+#ifdef WITH_FTP
+
 #define RETURN(xxx) { param->res = xxx; goto CLEANRET; }
 #define BUFSIZE 2048
 
@@ -21,14 +23,18 @@ void * ftpprchild(struct clientparam* param) {
  SOCKET sc = INVALID_SOCKET, ss = INVALID_SOCKET, clidatasock = INVALID_SOCKET;
  SASIZETYPE sasize;
  char * req = NULL;
+#ifndef _WIN32
  struct linger lg;
+#endif
  struct pollfd fds;
 
  if(!(buf = malloc(BUFSIZE))) RETURN(876);
  param->ctrlsock = param->clisock;
  param->operation = CONNECT;
+#ifndef _WIN32
  lg.l_onoff = 1;
- lg.l_linger = conf.timeouts[STRING_L];;
+ lg.l_linger = conf.timeouts[STRING_L];
+#endif
  if(socksend(param, param->ctrlsock, (unsigned char *)"220 Ready\r\n", 11, conf.timeouts[STRING_S])!=11) {RETURN (801);}
  for(;;){
 	i = sockgetlinebuf(param, CLIENT, buf, BUFSIZE - 10, '\n', conf.timeouts[CONNECTION_S]);
@@ -127,6 +133,7 @@ void * ftpprchild(struct clientparam* param) {
 			clidatasock = INVALID_SOCKET;
 		}
 		if ((clidatasock=socket(SASOCK(&param->sincl), SOCK_STREAM, IPPROTO_TCP)) == INVALID_SOCKET) {RETURN(821);}
+		if(intbindtodevice(param, clidatasock)){RETURN(822);}
 		*SAPORT(&param->sincl) = 0;
 		if(bindwithrange(param, clidatasock, &param->sincl, param->intport)){RETURN(822);}
 		if (pasv) {
@@ -259,8 +266,11 @@ void * ftpprchild(struct clientparam* param) {
 		}
 		sc = param->remsock;
 		param->remsock = ss;
+#ifndef _WIN32
+		/* not on Windows, see the accepting side in proxymain.c */
 		param->srv->so._setsockopt(param->sostate, param->remsock, SOL_SOCKET, SO_LINGER, (char *)&lg, sizeof(lg));
 		param->srv->so._setsockopt(param->sostate, clidatasock, SOL_SOCKET, SO_LINGER, (char *)&lg, sizeof(lg));
+#endif
 		param->clisock = clidatasock;
 		res = mapsocket(param, conf.timeouts[CONNECTION_S]);
 		if(param->remsock != INVALID_SOCKET) {
@@ -344,4 +354,17 @@ struct proxydef childdef = {
 	" -hdefault_host[:port] - use this host and port as default if no host specified\n"
 };
 #include "proxymain.c"
+#endif
+
+#else
+
+/* Built without FTP support. The service and the redirect naming it are
+   still known, so a configuration carrying them is read rather than
+   refused, and a client reaching one is turned away. */
+void * ftpprchild(struct clientparam * param){
+	param->res = 878;
+	dolog(param, (unsigned char *)"ftp support is not built in");
+	return NULL;
+}
+
 #endif

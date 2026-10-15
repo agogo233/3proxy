@@ -187,33 +187,6 @@ size_t threadstacksize(int extra){
 	if(size < (long)PTHREAD_STACK_MIN) size = (long)PTHREAD_STACK_MIN;
 	return (size_t)size;
 }
-
-int _3proxy_sem_init_f(_3proxy_sem_t *sem, unsigned count, unsigned maxcount){
-	sem->count = count;
-	sem->maxcount = maxcount;
-	if(pthread_mutex_init(&sem->mutex, NULL)) return 1;
-	if(pthread_cond_init(&sem->cond, NULL)){
-		pthread_mutex_destroy(&sem->mutex);
-		return 1;
-	}
-	return 0;
-}
-
-void _3proxy_sem_lock_f(_3proxy_sem_t *sem){
-	pthread_mutex_lock(&sem->mutex);
-	while(!sem->count) pthread_cond_wait(&sem->cond, &sem->mutex);
-	sem->count--;
-	pthread_mutex_unlock(&sem->mutex);
-}
-
-void _3proxy_sem_unlock_f(_3proxy_sem_t *sem){
-	pthread_mutex_lock(&sem->mutex);
-	if(sem->count < sem->maxcount){
-		sem->count++;
-		pthread_cond_signal(&sem->cond);
-	}
-	pthread_mutex_unlock(&sem->mutex);
-}
 #endif
 
 struct extparam conf = {
@@ -414,7 +387,6 @@ int
 	return shutdown(s, how);
     }
     int WINAPI def_closesocket(void* state, SOCKET s){
-	usleep(SLEEPTIME);
 	return closesocket(s);
     }
 #else
@@ -677,6 +649,55 @@ int connectwithpoll(struct clientparam *param, SOCKET sock, struct sockaddr *sa,
 }
 
 
+/* Number of ports tried before giving up when the range has to be searched by
+ * hand. The kernel option picks a free port itself and needs no retries. */
+#define RANGETRIES 10
+
+static int bindrange(struct clientparam *param, SOCKET sock, PROXYSOCKADDRTYPE *sa, uint32_t range, int *tries);
+
+/* -Di / -De: ties a socket to the interface asked for, for TCP and UDP alike.
+   Where the option is set per protocol, family is the one of the address the
+   socket will be bound to. */
+int bindtodevice(struct sockfuncs *sf, void *state, SOCKET sock, const char *device, int family){
+	if(!device) return 0;
+#if defined SO_BINDTODEVICE
+	if(sf->_setsockopt(state, sock, SOL_SOCKET, SO_BINDTODEVICE, device, strlen(device) + 1))
+		return 1;
+#elif defined IP_BOUND_IF
+	{
+	    int idx;
+	    idx = if_nametoindex(device);
+	    if(!idx || (family == AF_INET && sf->_setsockopt(state, sock, IPPROTO_IP, IP_BOUND_IF, &idx, sizeof(idx))))
+			return 1;
+#ifndef NOIPV6
+#ifndef IPV6_BOUND_IF
+#define IPV6_BOUND_IF 125
+#endif
+	    if(family == AF_INET6 && sf->_setsockopt(state, sock, IPPROTO_IPV6, IPV6_BOUND_IF, &idx, sizeof(idx))) return 1;
+#endif
+	}
+#endif
+	return 0;
+}
+
+/* the external side, a socket to be bound to sinsl */
+int extbindtodevice(struct clientparam *param, SOCKET sock){
+#if defined SO_BINDTODEVICE || defined IP_BOUND_IF
+	return bindtodevice(&param->srv->so, param->sostate, sock, param->srv->obindtodevice, *SAFAMILY(&param->sinsl));
+#else
+	return 0;
+#endif
+}
+
+/* the internal side, a socket to be bound to sincl */
+int intbindtodevice(struct clientparam *param, SOCKET sock){
+#if defined SO_BINDTODEVICE || defined IP_BOUND_IF
+	return bindtodevice(&param->srv->so, param->sostate, sock, param->srv->ibindtodevice, *SAFAMILY(&param->sincl));
+#else
+	return 0;
+#endif
+}
+
 int doconnect(struct clientparam * param){
  SASIZETYPE size;
 
@@ -693,7 +714,10 @@ int doconnect(struct clientparam * param){
 	if(param->srv->so._getpeername(param->sostate, param->remsock, (struct sockaddr *)&param->sinsr, &size)==-1) {return (14);}
  }
  else {
+#ifndef _WIN32
 	struct linger lg = {1,conf.timeouts[LINGER_TO]};
+#endif
+	int tries = RANGETRIES;
 
 	if(SAISNULL(&param->sinsr)){
 		if(SAISNULL(&param->req)) {
@@ -703,6 +727,7 @@ int doconnect(struct clientparam * param){
 		memcpy(SAADDR(&param->sinsr), SAADDR(&param->req), SAADDRLEN(&param->req)); 
 	}
 	if(!*SAPORT(&param->sinsr))*SAPORT(&param->sinsr) = *SAPORT(&param->req);
+	for(;;){
 	if ((param->remsock=param->srv->so._socket(param->sostate, SASOCK(&param->sinsr), SOCK_STREAM, 
 #ifdef WITH_UN
 	    *SAFAMILY(&param->sinsr) == AF_UNIX? 0 :
@@ -721,39 +746,34 @@ int doconnect(struct clientparam * param){
 			param->sinsl = param->srv->extsa;
 	}
 	*SAPORT(&param->sinsl) = 0;
-	setopts(param->remsock, param->srv->srvsockopts);
+	setopts(param->remsock, &param->srv->srvsockopts);
 
+#ifndef _WIN32
+	/* not on Windows, see the accepting side in proxymain.c */
 	param->srv->so._setsockopt(param->sostate, param->remsock, SOL_SOCKET, SO_LINGER, (char *)&lg, sizeof(lg));
-#if defined SO_BINDTODEVICE
-	if(param->srv->obindtodevice) {
-		if(param->srv->so._setsockopt(param->sostate, param->remsock, SOL_SOCKET, SO_BINDTODEVICE, param->srv->obindtodevice, strlen(param->srv->obindtodevice) + 1))
-			return 12;
-	}
-#elif defined IP_BOUND_IF
-	if(param->srv->obindtodevice) {
-	    int idx;
-	    idx = if_nametoindex(param->srv->obindtodevice);
-	    if(!idx || (*SAFAMILY(&param->sinsl) == AF_INET && param->srv->so._setsockopt(param->sostate, param->remsock, IPPROTO_IP, IP_BOUND_IF, &idx, sizeof(idx))))
-			return 12;
-#ifndef NOIPV6
-#ifndef IPV6_BOUND_IF
-#define IPV6_BOUND_IF 125
 #endif
-	    if(*SAFAMILY(&param->sinsl) == AF_INET6 && param->srv->so._setsockopt(param->sostate, param->remsock, IPPROTO_IPV6, IPV6_BOUND_IF, &idx, sizeof(idx))) return 12;
-#endif
-	}
-#endif
+	if(extbindtodevice(param, param->remsock)) return 12;
 #ifdef WITH_UN
 	if(*SAFAMILY(&param->sinsl) != AF_UNIX)
 #endif
-	if(bindwithrange(param, param->remsock, &param->sinsl, param->extport)==-1) {
+	if(bindrange(param, param->remsock, &param->sinsl, param->extport, &tries)==-1) {
 		return 12;
 	}
 	
-	if(param->operation >= 256 || (param->operation & CONNECT) || param->redirected){
-		if(connectwithpoll(param, param->remsock,(struct sockaddr *)&param->sinsr,SASIZE(&param->sinsr),conf.timeouts[CONNECT_TO])) {
-			return 13;
-		}
+	if(!(param->operation >= 256 || (param->operation & CONNECT) || param->redirected)) break;
+	if(!connectwithpoll(param, param->remsock,(struct sockaddr *)&param->sinsr,SASIZE(&param->sinsr),conf.timeouts[CONNECT_TO])) break;
+	/* The port was free to bind, but the pair it makes with the destination
+	   is still closing from an earlier connection through the same range,
+	   which Windows refuses. Another port out of the range may do. Anything
+	   else is the destination's own answer, and is not worth a second port.
+	   The ports come out of the allowance the bind is already spending, so
+	   the range is not searched any harder than one bind would search it and
+	   the attempts parentretries makes are not multiplied. Counted here as
+	   well, since the kernel option hands out a port without spending any of
+	   the allowance. */
+	if(!param->extport || errno != EADDRINUSE || --tries <= 0) return 13;
+	param->srv->so._closesocket(param->sostate, param->remsock);
+	param->remsock = INVALID_SOCKET;
 	}
 	size = sizeof(param->sinsl);
 	if(param->srv->so._getsockname(param->sostate, param->remsock, (struct sockaddr *)&param->sinsl, &size)==-1) {return (15);}
@@ -767,10 +787,6 @@ int doconnect(struct clientparam * param){
  return 0;
 }
 
-/* Number of ports tried before giving up when the range has to be searched by
- * hand. The kernel option picks a free port itself and needs no retries. */
-#define RANGETRIES 10
-
 /* Bind sock to sa, taking the local port from the range if one is set. The
  * range is packed as first | last << 16.
  *
@@ -778,11 +794,15 @@ int doconnect(struct clientparam * param){
  * are free. Where the option does not exist, or the kernel refuses it, or the
  * address family is not one it covers, pick a port at random instead and retry
  * on failure, since the one picked may already be taken.
+ *
+ * *tries is how many ports may still be taken out of the range. A caller which
+ * has to come back for another port, because the one it was given turned out
+ * to be unusable for the connection it wanted, carries the same count along
+ * and so cannot spend more attempts than one call would.
  */
-int bindwithrange(struct clientparam *param, SOCKET sock, PROXYSOCKADDRTYPE *sa, uint32_t range)
+static int bindrange(struct clientparam *param, SOCKET sock, PROXYSOCKADDRTYPE *sa, uint32_t range, int *tries)
 {
 	uint16_t first, last;
-	int i;
 
 	if(!range) return param->srv->so._bind(param->sostate, sock, (struct sockaddr *)sa, SASIZE(sa));
 
@@ -798,7 +818,8 @@ int bindwithrange(struct clientparam *param, SOCKET sock, PROXYSOCKADDRTYPE *sa,
 	first = (uint16_t)(range & 0xffff);
 	last = (uint16_t)(range >> 16);
 
-	for(i = 0; i < RANGETRIES; i++){
+	while(*tries > 0){
+		(*tries)--;
 		*SAPORT(sa) = htons((uint16_t)(first + (myrand() % (unsigned)(last - first + 1))));
 		if(!param->srv->so._bind(param->sostate, sock, (struct sockaddr *)sa, SASIZE(sa))) return 0;
 	}
@@ -808,6 +829,13 @@ int bindwithrange(struct clientparam *param, SOCKET sock, PROXYSOCKADDRTYPE *sa,
 	   an exhausted range behaves the same way on every platform. */
 	*SAPORT(sa) = 0;
 	return param->srv->so._bind(param->sostate, sock, (struct sockaddr *)sa, SASIZE(sa));
+}
+
+int bindwithrange(struct clientparam *param, SOCKET sock, PROXYSOCKADDRTYPE *sa, uint32_t range)
+{
+	int tries = RANGETRIES;
+
+	return bindrange(param, sock, sa, range, &tries);
 }
 
 int scanaddr(const unsigned char *s, uint32_t * ip, uint32_t * mask) {

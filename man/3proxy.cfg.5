@@ -95,16 +95,19 @@ SNI proxy (destination address is taken from TLS handshake), may be used to redi
 Proxy with protocol autoselection between proxy / socks / tlspr
 .br
 .B pop3p
-POP3 proxy (default port 110)
+POP3 proxy (default port 110), in a build which has one: otherwise the
+service is \fBtlspr\fR speaking POP3 to negotiate STARTTLS, under this name.
 .br
 .B imapp
-IMAPv4 proxy (default port 143)
+IMAPv4 proxy (default port 143), or \fBtlspr\fR speaking IMAP, as above.
 .br
 .B smtpp
-SMTP proxy (default port 25)
+SMTP proxy (default port 25), or \fBtlspr\fR speaking SMTP, as above.
 .br
 .B ftppr
-FTP proxy (default port 21)
+FTP proxy (default port 21), in a build with FTP support. Without it the
+service is known but answers nothing, and \fBftp://\fR is not a URL the HTTP
+proxy fetches.
 .br
 .B admin
 Web interface (default port 80)
@@ -181,8 +184,10 @@ connect to given remote HOST:port instead of listening local connection on -p or
 .br
 .B -oc\fIOPTIONS\fB, -os\fIOPTIONS\fB, -ol\fIOPTIONS\fB, -or\fIOPTIONS\fB, -oR\fIOPTIONS\fR
 options for proxy-to-client (\fB-oc\fR), proxy-to-server (\fB-os\fR), proxy listening (\fB-ol\fR), connect back client (\fB-or\fR), connect back listening (\fB-oR\fR) sockets.
+\fIOPTIONS\fR is a comma separated list of \fINAME\fR or \fINAME\fR=\fIVALUE\fR; a name alone sets the option to 1 (TCP_MAXSEG to the value of \fBmaxseg\fR), and \fINAME\fR=0 turns it off. Options add to the defaults and to the options given earlier for the same socket. An unknown name or a value which is not a number is an error.
+TCP_NODELAY is set by default on proxy-to-client and proxy-to-server sockets, so a reply written in several parts is not delayed by Nagle's algorithm; use \fB-ocTCP_NODELAY=0\fR or \fB-osTCP_NODELAY=0\fR to turn it off, e.g. to send fewer packets on slow links.
 Options like TCP_CORK, TCP_NODELAY, TCP_DEFER_ACCEPT, TCP_QUICKACK, TCP_TIMESTAMPS, TCP_FASTOPEN, SO_REUSEADDR, SO_REUSEPORT, SO_EXCLUSIVEADDRUSE, SO_PORT_SCALABILITY, SO_REUSE_UNICASTPORT, SO_KEEPALIVE, SO_DONTROUTE may be supported depending on OS.
-SO_REUSEADDR and SO_REUSEPORT are set on the listening socket by default on Unix. On Windows SO_REUSEADDR is not set: it is not required to rebind a listening port and it only lets another local process bind the same address and port. Use SO_EXCLUSIVEADDRUSE (Windows) on the listening socket (\fB-ol\fR) to prevent that.
+SO_REUSEADDR and SO_REUSEPORT are set by default on the listening sockets (\fB-ol\fR, \fB-oR\fR) on Unix; \fB-olSO_REUSEPORT=0\fR turns one off. On Windows SO_REUSEADDR is not set: it is not required to rebind a listening port and it only lets another local process bind the same address and port. Use SO_EXCLUSIVEADDRUSE (Windows) on the listening socket (\fB-ol\fR) to prevent that.
 .br
 .B -H
 (for all services) Expect HAProxy PROXY protocol v1 header on incoming connection.
@@ -197,11 +202,18 @@ delay GRACE_DELAY milliseconds before polling if average polling size is below G
  (for admin) secure, allow only secure operations, currently only traffic counters
 view without ability to reset.
 .br
- (for TCP services, Linux) enable splice(). splice() is not built by default and
-is disabled even when built, because current Linux does not implement
-SPLICE_F_MOVE, so no real zero-copy takes place and the read/write path is faster
-for most traffic. Rebuild with -DWITHSPLICE to make -s available, -s0 disables it
-explicitly.
+ (for TCP services, Linux) use splice() to pass data between the client and the
+server without copying it through 3proxy. \fB-s\fR alone splices both directions where
+it pays: a body of known length if at least 16K of it is left to read, a stream
+once it carries large reads, back to copying when they turn small. \fB-s1\fR always
+splices what the server sends to the client (downloads), \fB-s2\fR what the client
+sends (uploads), \fB-s3\fR both; adding 4 (\fB-s5\fR, \fB-s6\fR, \fB-s7\fR, the last the same as
+\fB-s\fR) splices those directions only where it pays. \fB-s0\fR, the default, turns it
+off. splice() suits large transfers: they go faster and use less CPU; small
+requests go slower with it. A spliced direction needs a pipe (two file
+descriptors), made when first needed and kept for the connection, and more
+kernel memory; data filters are not applied to spliced data. Available in builds
+with WITHSPLICE, the default on Linux.
 .br
 .B -C
  (for TCP services) a connection closed by any of the sides terminates the
@@ -241,6 +253,12 @@ Never ask for username/password
 .br
 .B -a2
 (for proxy) generate Via: and X-Forwarded-For: instead of Forwarded:
+.br
+.B -Xftp
+(for proxy) fetch \fBftp://\fR URLs, in a build with FTP support. Without
+this the scheme is not one the service knows, whatever the build: fetching it
+opens a second connection and builds a listing, which a service serving http
+has no use for.
 .br
  Also, all options mentioned for 
 .BR proxy (8)
@@ -508,6 +526,13 @@ system routines for name resolution is
 used. Optional port number may be specified.
 If optional /tcp is added to IP address, name resolution is
 performed over TCP.
+An IPv6 address has to be enclosed in square brackets:
+.br
+ \fBnserver 1.1.1.1\fR
+.br
+ \fBnserver [2001:4860:4860::8844]\fR
+.br
+ \fBnserver [2001:4860:4860::8844]:5353/tcp\fR
 
 .br
 .BR authnserver
@@ -860,9 +885,35 @@ build proxy chain. Proxies may be grouped. Proxy inside the
 group is selected randomly. If few groups are specified one proxy
 is randomly picked from each group and chain of proxies is created
 (that is second proxy connected through first one and so on).
-Weight is used to group proxies. Weight is a number between 1 and 1000.
-Weights are summed and proxies are grouped together until the weight of
-the group is 1000. That is:
+Weight is used to group proxies. A weight is a share of the whole, written
+either as a fraction of one, anything beginning with 0 or with a point, or the
+old way, in thousandths:
+.br
+ \fB.5\fR and \fB0.5\fR and \fB500\fR are all a half
+.br
+ \fB.333\fR and \fB333\fR are both 333 thousandths
+.br
+ \fB1000\fR and \fB1.0\fR and \fB100%\fR are all the whole share
+.br
+ \fB50.5%\fR and \fB.505\fR and \fB505\fR are all the same share
+.br
+ \fB0\fR is a fallback, described below
+.br
+ A fraction takes up to nine digits after the point, \fB.333333333\fR being
+the finest share there is, and the old notation may now carry further digits
+after a point of its own, so \fB123.456\fR means the same as \fB.123456\fR.
+Weights are scanned as integers, nothing is read as a floating point number.
+\fB1.0\fR, with as many zeroes after the point as you care to write, is the
+one weight read as it looks rather than in thousandths, so that the whole
+share can be written as a fraction too: a bare \fB1\fR is still a thousandth
+of it, and \fB1.5\fR still one and a half of them. A weight ending in
+\fB%\fR is a percentage, and takes up to seven digits after the point.
+.br
+ Weights are summed and proxies are grouped together until the weight of
+the group is the whole share. A group which falls short of it by no more than
+a thousandth, which three weights of \fB333\fR do, is taken for a whole one
+rather than for a group with a remainder, so a share which cannot be divided
+evenly needs no adjusting by hand. That is:
 .br
  allow *
 .br
@@ -871,7 +922,8 @@ the group is 1000. That is:
  parent 500 connect 192.168.10.1 3128
 .br
  makes 3proxy to randomly choose between 2 proxies for all outgoing
-connections. These 2 proxies form 1 group (summarized weight is 1000).
+connections. These 2 proxies form 1 group (their weights are the whole share
+between them).
 .br
  allow * * * 80
 .br
@@ -892,7 +944,7 @@ with probability of 0.7) for outgoing web connections. Chains are only applied t
 .br
  \fBextip\fR does not actually redirect the request; it sets the external address for this request to \fI<ip>\fR. It can be chained with another parent type. It's useful to set the external IP based on ACL or make it random.
 .br
- \fBextport\fR does not redirect the request; it sets the range the local port of outgoing connections is taken from, given as \fIFIRST-LAST\fR inclusive in place of the port argument, with 0.0.0.0 as the address, for example \fBparent 1000 extport 0.0.0.0 40000-40100\fR. Where the system can be asked to pick the port itself (Linux \fBIP_LOCAL_PORT_RANGE\fR) it does, otherwise a port is picked at random from the range and retried if it is already in use, up to ten times. On Linux the range has to lie within \fInet.ipv4.ip_local_port_range\fR, commonly 32768-60999: the kernel ignores a range outside it and picks an ordinary ephemeral port instead. If no port in the range can be bound, an ephemeral port is used rather than failing the connection. It can be chained with another parent type, and the access rule it belongs to decides which requests it applies to, so \fBallow * * * * UDPASSOC\fR followed by \fBparent 1000 extport 0.0.0.0 40000-40100\fR limits it to UDP associations. The range is applied when the outgoing connection is made, so a kept alive connection carrying several requests uses the rule that matched when it was opened.
+ \fBextport\fR does not redirect the request; it sets the range the local port of outgoing connections is taken from, given as \fIFIRST-LAST\fR inclusive in place of the port argument, with 0.0.0.0 as the address, for example \fBparent 1000 extport 0.0.0.0 40000-40100\fR. Where the system can be asked to pick the port itself (Linux \fBIP_LOCAL_PORT_RANGE\fR) it does, otherwise a port is picked at random from the range and retried if it is already in use, up to ten times. A port which binds but whose pair with the destination is still closing from an earlier connection, which Windows refuses at the connect, is retried in the same way and out of the same ten tries, so a repeated connection to one destination does not fail for a port it has just used. On Linux the range has to lie within \fInet.ipv4.ip_local_port_range\fR, commonly 32768-60999: the kernel ignores a range outside it and picks an ordinary ephemeral port instead. If no port in the range can be bound, an ephemeral port is used rather than failing the connection. It can be chained with another parent type, and the access rule it belongs to decides which requests it applies to, so \fBallow * * * * UDPASSOC\fR followed by \fBparent 1000 extport 0.0.0.0 40000-40100\fR limits it to UDP associations. The range is applied when the outgoing connection is made, so a kept alive connection carrying several requests uses the rule that matched when it was opened.
 .br
  \fBintport\fR is the same for sockets bound on the side facing the client: the port a UDP association tells the client to send its datagrams to, and the FTP proxy data connection.
 .br
@@ -1004,12 +1056,37 @@ local HTTP proxy parses requests and allows only GET and POST requests.
 .br
  Optional username and password are used to authenticate on parent
 proxy. Username of \'*\' means username must be supplied by user.
+.br
+ A parent which fails is taken out of the choice for the rest of that
+connection, so the next attempt, see \fBparentretries\fR, goes to another
+member of the group instead of the same parent again. Its share is spread over
+the parents of the group which are left, in proportion to their weights.
+.br
+ Weight 0 marks a fallback parent. Such a parent takes no share of the random
+choice, and none of the share left over by a parent which failed, and is only
+used once every weighted parent of its group has failed,
+which is how a parent used only when another one is down is configured:
+.br
+ allow *
+.br
+ parent 1000 socks5 192.168.10.1 1080
+.br
+ parent 0 socks5 192.168.20.1 1080
+.br
+ Several fallbacks are tried in the order they are written. Reaching a fallback
+costs an attempt, so \fBparentretries\fR has to be at least as large as the
+number of parents to try.
+.br
+ When every parent of a group has failed the request fails as well, rather
+than being sent without a parent.
 
 .br
 .BR parentretries
 \fI<number>\fR
 .br
- Number of retries to connect to parent proxy. Default is 1.
+ Number of attempts to reach a parent proxy. Default is 2. Each attempt
+picks a parent again, leaving out the ones which already failed, so this is
+also the number of different parents a request may be tried through.
 
 
 .br
@@ -1311,7 +1388,12 @@ for all threads.
 .BR chroot
 \fI<path>\fR [\fI<uid>\fR] [\fI<gid>\fR]
 .br
- calls chroot(path) and sets gid/uid. Unix only. uid/gid supported since 0.9, can be numeric or username/groupname
+ calls chroot(path) and sets gid/uid. Unix only. uid/gid supported since 0.9, can be numeric or username/groupname.
+The time zone and the syslog connection are set up before the call.
+Plugins which read their own configuration or load modules while running need them inside the chroot:
+PAM (\fI/etc/pam.d\fR and the modules it names, read for every authentication),
+LDAP (\fIldap.conf\fR and, for ldaps, the CA certificates),
+ODBC (\fIodbc.ini\fR, \fIodbcinst.ini\fR and the driver libraries, loaded again whenever the connection is reopened).
 
 .br
 .BR stacksize
@@ -1572,6 +1654,22 @@ identical to allow/deny/bandlimin commands. The regular expression is only
 matched if the ACL matches the connection data.
 Warning: Regular expressions don't require authentication and cannot replace
 authentication and/or allow/deny ACLs.
+
+.SH OPTIONAL SERVICES
+The mail proxies and FTP are built when they are asked for, and are not in a
+default build. \fBMAILPROXY=true\fR builds \fBpop3p\fR, \fBimapp\fR and
+\fBsmtpp\fR, and \fBFTP=true\fR builds \fBftppr\fR and the \fBftp://\fR
+scheme of the HTTP proxy, which a \fBproxy\fR service then still has to ask
+for with \fB-Xftp\fR; with CMake the switches are
+\fB-D3PROXY_USE_MAILPROXY=ON\fR and \fB-D3PROXY_USE_FTP=ON\fR. The standalone
+binaries of those services are built with them and not without.
+.br
+ A configuration naming a service which was not built is still read. The three
+mail proxies become \fBtlspr\fR negotiating STARTTLS in that protocol, which
+is what most of their use amounts to now that the mail protocols are used over
+TLS, and a \fBparent\fR chain naming \fBpop3\fR, \fBimap\fR or \fBsmtp\fR
+does the same. \fBftppr\fR is answered by nothing: a client reaching it is
+turned away and the refusal logged, since there is no protocol to fall back on.
 
 .SH BUILT IN HTTP SERVER
 The \fBhttpsrv\fR service answers requests itself instead of forwarding them.

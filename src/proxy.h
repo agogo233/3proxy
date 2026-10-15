@@ -86,6 +86,10 @@
 #ifndef EINPROGRESS
 #define EINPROGRESS WSAEWOULDBLOCK
 #endif
+#ifdef EADDRINUSE
+#undef EADDRINUSE
+#endif
+#define EADDRINUSE WSAEADDRINUSE
 #define EINTR WSAEWOULDBLOCK
 #define SLEEPTIME 1
 #define usleep Sleep
@@ -235,6 +239,11 @@ extern struct extparam conf;
 
 extern int timeouts[12];
 
+/* directions sockmap() passes with splice(): -s1, -s2, -s3; with
+   SPLICE_AUTO (-s alone, -s5 to -s7) only when it pays */
+#define SPLICE_DOWNLOAD 1
+#define SPLICE_UPLOAD 2
+#define SPLICE_AUTO 4
 int sockmap(struct clientparam * param, int timeo, int usesplice);
 int udpsockmap(struct clientparam * param, int timeo);
 int udpbind(struct clientparam * param);
@@ -318,13 +327,23 @@ extern _3proxy_sem_t udpinit;
 #define _3proxy_sem_init(x, count, maxcount) (((x) = CreateSemaphore(NULL, (count), (maxcount), NULL))? 0 : 1)
 #define _3proxy_sem_lock(x) WaitForSingleObject(x, INFINITE)
 #define _3proxy_sem_unlock(x) ReleaseSemaphore(x, 1, NULL)
+#define _3proxy_sem_init_timed(x, count, maxcount) _3proxy_sem_init(x, (count), (maxcount))
+#define _3proxy_sem_timedlock(x, ms) (WaitForSingleObject(x, ms) != WAIT_OBJECT_0)
+#define _3proxy_sem_destroy(x) CloseHandle(x)
 #else
-int _3proxy_sem_init_f(_3proxy_sem_t *sem, unsigned count, unsigned maxcount);
+int _3proxy_sem_init_f(_3proxy_sem_t *sem, unsigned count, unsigned maxcount, int timed);
 void _3proxy_sem_lock_f(_3proxy_sem_t *sem);
+int _3proxy_sem_timedlock_f(_3proxy_sem_t *sem, unsigned ms);
 void _3proxy_sem_unlock_f(_3proxy_sem_t *sem);
-#define _3proxy_sem_init(x, count, maxcount) _3proxy_sem_init_f(&x, (count), (maxcount))
+void _3proxy_sem_destroy_f(_3proxy_sem_t *sem);
+#define _3proxy_sem_init(x, count, maxcount) _3proxy_sem_init_f(&x, (count), (maxcount), 0)
+/* for a semaphore waited on with a timeout: the wait is not stretched or cut
+   short by the system time being changed, where the platform allows it */
+#define _3proxy_sem_init_timed(x, count, maxcount) _3proxy_sem_init_f(&x, (count), (maxcount), 1)
 #define _3proxy_sem_lock(x) _3proxy_sem_lock_f(&x)
+#define _3proxy_sem_timedlock(x, ms) _3proxy_sem_timedlock_f(&x, (ms))
 #define _3proxy_sem_unlock(x) _3proxy_sem_unlock_f(&x)
+#define _3proxy_sem_destroy(x) _3proxy_sem_destroy_f(&x)
 #endif
 
 
@@ -387,6 +406,9 @@ int readconfig(FILE * fp);
 void initcommands(void);
 int connectwithpoll(struct clientparam *param, SOCKET sock, struct sockaddr *sa, SASIZETYPE size, int to);
 int bindwithrange(struct clientparam *param, SOCKET sock, PROXYSOCKADDRTYPE *sa, uint32_t range);
+int bindtodevice(struct sockfuncs *sf, void *state, SOCKET sock, const char *device, int family);
+int extbindtodevice(struct clientparam *param, SOCKET sock);
+int intbindtodevice(struct clientparam *param, SOCKET sock);
 #ifdef WITH_PCRE
 /* One regular expression implementation for the whole program: the pcre
    commands and every pattern that carries a pcre: prefix. */
@@ -450,6 +472,10 @@ struct dictionary;
 struct node;
 struct property;
 extern _3proxy_mutex_t config_mutex;
+/* services running, and a post each time one of them has finished */
+extern int runningservices;
+extern _3proxy_mutex_t runningservices_mutex;
+extern _3proxy_sem_t serviceexited;
 extern _3proxy_mutex_t bandlim_mutex;
 extern _3proxy_mutex_t connlim_mutex;
 extern _3proxy_mutex_t tc_mutex;
@@ -460,7 +486,7 @@ extern struct datatype datatypes[64];
 extern struct commands commandhandlers[];
 
 #ifdef WITHSPLICE
-#define mapsocket(a,b) ((a->srv->usesplice && !a->ndatfilterssrv && !a->ndatfilterscli)?sockmap(a,b,1):sockmap(a,b,0))
+#define mapsocket(a,b) ((a->srv->usesplice && !a->ndatfilterssrv && !a->ndatfilterscli)?sockmap(a,b,a->srv->usesplice):sockmap(a,b,0))
 #else
 #define mapsocket(a,b) sockmap(a,b, 0)
 #endif
@@ -480,7 +506,8 @@ extern struct socketoptions {
 	int opt;
 	char * optname;
 } sockopts[];
-void setopts(SOCKET s, int opts);
+int getopts(const char *s, struct sockoptset *opts);
+void setopts(SOCKET s, const struct sockoptset *opts);
 char * printopts(char *sep);
 
 #ifdef _WINCE

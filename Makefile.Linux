@@ -4,9 +4,9 @@
 # add -DWITH_ODBC to CFLAGS and -lodbc to LIBS to compile with ODBC
 # library support. Add -DSAFESQL for poorely written ODBC library / drivers.
 #
-# Linux splice() support is not built by default, it is slower than the
-# read/write path for most traffic. Add -DWITHSPLICE to CFLAGS to build it,
-# it must additionally be enabled per service with the -s option.
+# Linux splice() support is built, but used only by services given the -s
+# option: it is faster for large transfers and slower for small requests.
+# Remove -DWITHSPLICE from CFLAGS to build without it.
 
 BUILDDIR = ../bin/
 PREFIX ?= 3proxy_
@@ -14,7 +14,7 @@ CRYPT_PREFIX ?= $(PREFIX)
 CC ?= gcc
 
 CFLAGS ?= -O3 -flto
-CFLAGS += -fno-strict-aliasing -c -pthread -D_GNU_SOURCE -DGETHOSTBYNAME_R -D_THREAD_SAFE -D_REENTRANT -DFD_SETSIZE=4096 -DWITH_POLL -DWITH_NETFILTER -D WITH_UN
+CFLAGS += -fno-strict-aliasing -c -pthread -DWITHSPLICE -D_GNU_SOURCE -DGETHOSTBYNAME_R -D_THREAD_SAFE -D_REENTRANT -DFD_SETSIZE=4096 -DWITH_POLL -DWITH_NETFILTER -D WITH_UN
 COUT = -o 
 LN ?= ${CC}
 DCFLAGS ?= -fPIC
@@ -27,6 +27,16 @@ CFLAGS += $(EXTRA_CFLAGS)
 LDFLAGS += $(EXTRA_LDFLAGS)
 # The HTTP server serves the endpoints declared by http lines. The admin
 # interface is built on top of it, so turning it off removes both.
+MAILPROXY ?= false
+ifeq ($(MAILPROXY),true)
+    CFLAGS += -DWITH_POP3P -DWITH_IMAPP -DWITH_SMTPP
+    MAIL_EXES = $(BUILDDIR)$(PREFIX)pop3p$(EXESUFFICS) $(BUILDDIR)$(PREFIX)imapp$(EXESUFFICS) $(BUILDDIR)$(PREFIX)smtpp$(EXESUFFICS)
+endif
+FTP ?= false
+ifeq ($(FTP),true)
+    CFLAGS += -DWITH_FTP
+    FTP_EXES = $(BUILDDIR)$(PREFIX)ftppr$(EXESUFFICS)
+endif
 HTTPSRV ?= true
 ifeq ($(HTTPSRV),true)
     CFLAGS += -DWITH_HTTPSRV
@@ -113,15 +123,18 @@ INSTALL_BIN	= $(INSTALL) -m 755
 INSTALL_DATA	= $(INSTALL) -m 644
 INSTALL_OBJS	= bin/3proxy \
 		  bin/$(CRYPT_PREFIX)crypt \
-		  bin/$(PREFIX)ftppr \
-		  bin/$(PREFIX)imapp \
-		  bin/$(PREFIX)pop3p \
 		  bin/$(PREFIX)proxy \
-		  bin/$(PREFIX)smtpp \
 		  bin/$(PREFIX)socks \
 		  bin/$(PREFIX)tcppm \
 		  bin/$(PREFIX)tlspr \
 		  bin/$(PREFIX)udppm
+# the mail proxies and ftppr are only there when they were built
+ifeq ($(MAILPROXY),true)
+INSTALL_OBJS	+= bin/$(PREFIX)imapp bin/$(PREFIX)pop3p bin/$(PREFIX)smtpp
+endif
+ifeq ($(FTP),true)
+INSTALL_OBJS	+= bin/$(PREFIX)ftppr
+endif
 		  
 
 INSTALL_CFG	 = scripts/3proxy.cfg.chroot
@@ -179,7 +192,7 @@ install-man:
 	$(INSTALL_DATA) man/3proxy.cfg.5 $(MANDIR5)
 	$(INSTALL_DATA) man/3proxy.8 $(MANDIR8)
 	for f in proxy socks pop3p imapp smtpp ftppr tcppm udppm tlspr; do \
-	  if [ -f man/$$f.8 ]; then $(INSTALL_DATA) man/$$f.8 $(MANDIR8)/$(PREFIX)$$f.8; fi; \
+	  if [ -f man/$$f.8 ] && [ -f bin/$(PREFIX)$$f ]; then $(INSTALL_DATA) man/$$f.8 $(MANDIR8)/$(PREFIX)$$f.8; fi; \
 	done
 	$(INSTALL_DATA) man/3proxy_crypt.8 $(MANDIR8)/$(CRYPT_PREFIX)crypt.8
 

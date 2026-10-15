@@ -63,13 +63,15 @@ option(3PROXY_USE_OPENSSL "Enable TLS/SSL support via OpenSSL (fallback when wol
 option(3PROXY_USE_PCRE2 "Enable PCRE2 regex filtering" ON)
 option(3PROXY_USE_PAM "Enable PAM/PamAuth" ON)
 option(3PROXY_USE_ODBC "Enable ODBC support (Unix only, always ON on Windows)" OFF)
-option(3PROXY_USE_SPLICE "Build Linux splice() support, slower than read/write for most traffic (Linux only)" OFF)
+option(3PROXY_USE_SPLICE "Build Linux splice() support, used by services given -s (Linux only)" ON)
 option(3PROXY_USE_POLL "Use poll() instead of select() (Unix only)" ON)
 option(3PROXY_USE_WSAPOLL "Use WSAPoll instead of select() (Windows only)" ON)
 option(3PROXY_USE_NETFILTER "Enable Linux netfilter support (Linux only)" ON)
 option(3PROXY_USE_TRANSPARENT "Build transparent proxying support (Linux and BSD only)" ON)
 option(3PROXY_USE_UNIX_SOCKETS "Enable Unix domain socket support (Unix only)" ON)
 option(3PROXY_USE_HTTPSRV "Build the HTTP server and the admin interface on top of it" ON)
+option(3PROXY_USE_MAILPROXY "Build the pop3p, imapp and smtpp proxies" OFF)
+option(3PROXY_USE_FTP "Build FTP support: the ftppr service and ftp:// in the HTTP proxy" OFF)
 
 if(NOT WIN32 AND NOT APPLE)
     option(3PROXY_STATIC_LINK "Statically link libraries using -Wl,-Bstatic (Linux/Unix only)" OFF)
@@ -83,10 +85,13 @@ set(3PROXY_BINARY_PREFIX "3proxy_" CACHE STRING "Prefix for standalone module an
 option(3PROXY_BUILD_NONE   "Do not build standalone binaries"   OFF)
 option(3PROXY_BUILD_PROXY  "Build standalone proxy binary"  ON)
 option(3PROXY_BUILD_SOCKS  "Build standalone socks binary"  ON)
-option(3PROXY_BUILD_POP3P  "Build standalone pop3p binary"  ON)
-option(3PROXY_BUILD_IMAPP  "Build standalone imapp binary"  ON)
-option(3PROXY_BUILD_SMTPP  "Build standalone smtpp binary"  ON)
-option(3PROXY_BUILD_FTPPR  "Build standalone ftppr binary"  ON)
+# The mail proxies and FTP are asked for rather than assumed: without them
+# pop3p, imapp and smtpp are the STARTTLS proxy under those names, and ftp
+# is not spoken at all. A standalone binary needs the support it is made of.
+option(3PROXY_BUILD_POP3P  "Build standalone pop3p binary"  OFF)
+option(3PROXY_BUILD_IMAPP  "Build standalone imapp binary"  OFF)
+option(3PROXY_BUILD_SMTPP  "Build standalone smtpp binary"  OFF)
+option(3PROXY_BUILD_FTPPR  "Build standalone ftppr binary"  OFF)
 option(3PROXY_BUILD_TCPPM  "Build standalone tcppm binary"  ON)
 option(3PROXY_BUILD_UDPPM  "Build standalone udppm binary"  ON)
 option(3PROXY_BUILD_TLSPR  "Build standalone tlspr binary"  ON)
@@ -250,6 +255,14 @@ else()
     )
 endif()
 
+if(3PROXY_USE_MAILPROXY)
+    add_compile_definitions(WITH_POP3P WITH_IMAPP WITH_SMTPP)
+endif()
+
+if(3PROXY_USE_FTP)
+    add_compile_definitions(WITH_FTP)
+endif()
+
 if(3PROXY_USE_HTTPSRV)
     add_compile_definitions(WITH_HTTPSRV)
 endif()
@@ -402,11 +415,12 @@ set(3PROXY_CORE_SOURCES
 # Object libraries for common sources (shared between executables)
 # ============================================================================
 
-# Common object library (sockmap, sockgetchar, common, log)
+# Common object library (sockmap, sockgetchar, common, sem, log)
 add_library(common_obj OBJECT
     src/sockmap.c
     src/sockgetchar.c
     src/common.c
+    src/sem.c
     src/log.c
 )
 target_include_directories(common_obj PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -684,6 +698,15 @@ foreach(PROXY_NAME proxy socks pop3p imapp smtpp ftppr tcppm udppm tlspr)
         continue()
     endif()
 
+    # A binary of nothing: without the support built, these files hold the
+    # stand-in the main binary uses and no service of their own.
+    if(NOT 3PROXY_USE_MAILPROXY AND PROXY_NAME MATCHES "^(pop3p|imapp|smtpp)$")
+        continue()
+    endif()
+    if(NOT 3PROXY_USE_FTP AND PROXY_NAME STREQUAL "ftppr")
+        continue()
+    endif()
+
     if(PROXY_NAME STREQUAL "ftppr" OR PROXY_NAME STREQUAL "proxy")
         # ftppr and proxy use ftp_obj
         add_executable(${PROXY_NAME}
@@ -706,12 +729,12 @@ foreach(PROXY_NAME proxy socks pop3p imapp smtpp ftppr tcppm udppm tlspr)
         ${CMAKE_CURRENT_SOURCE_DIR}/src
     )
 
-    target_compile_definitions(${PROXY_NAME} PRIVATE
-        WITHMAIN
-        NOPORTMAP
-    )
+    target_compile_definitions(${PROXY_NAME} PRIVATE WITHMAIN)
 
-    if(NOT PROXY_NAME STREQUAL "udppm")
+    # each takes the main loop of its kind only: udppm UDP, the others TCP
+    if(PROXY_NAME STREQUAL "udppm")
+        target_compile_definitions(${PROXY_NAME} PRIVATE NOTCPMAIN)
+    else()
         target_compile_definitions(${PROXY_NAME} PRIVATE NOUDPMAIN)
     endif()
 
@@ -721,8 +744,12 @@ foreach(PROXY_NAME proxy socks pop3p imapp smtpp ftppr tcppm udppm tlspr)
         target_compile_definitions(${PROXY_NAME} PRIVATE ANONYMOUS)
     endif()
 
+    # port mappers take port, host and port as arguments, the others options
+    # only; one of the two is defined, as in src/Makefile.inc
     if(PROXY_NAME STREQUAL "tcppm" OR PROXY_NAME STREQUAL "udppm" OR PROXY_NAME STREQUAL "tlspr")
         target_compile_definitions(${PROXY_NAME} PRIVATE PORTMAP)
+    else()
+        target_compile_definitions(${PROXY_NAME} PRIVATE NOPORTMAP)
     endif()
 
     if(WIN32)

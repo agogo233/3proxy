@@ -121,6 +121,11 @@ int udpbind(struct clientparam *param)
 	fcntl(s, F_SETFL, O_NONBLOCK | fcntl(s, F_GETFL));
 #endif
 	param->remsock = s;
+	if (extbindtodevice(param, param->remsock)) {
+		param->srv->so._closesocket(param->sostate, param->remsock);
+		param->remsock = INVALID_SOCKET;
+		return 12;
+	}
 	if (bindwithrange(param, param->remsock, &param->sinsl, param->extport)) {
 		if (param->extport) {
 			param->srv->so._closesocket(param->sostate, param->remsock);
@@ -287,6 +292,12 @@ int udpsockmap(struct clientparam *param, int timeo)
 				break;
 			}
 			default: return 997;
+			}
+			/* As for TCP requests, a literal address is the host name,
+			   otherwise an ACL with host names only matches any address */
+			if (!dstname) {
+				myinet_ntop(*SAFAMILY(&dst), SAADDR(&dst), dstnamebuf, sizeof(dstnamebuf));
+				dstname = dstnamebuf;
 			}
 			memcpy(SAPORT(&dst), base + i, 2);
 			i += 2;
