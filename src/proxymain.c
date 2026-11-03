@@ -63,6 +63,8 @@ void * threadfunc (void *p) {
 		}
 		param->remsock = param->srv->so._accept(param->sostate, param->srv->cbsock, (struct sockaddr*)&param->sinsr, &size);
 		if(param->remsock == INVALID_SOCKET) {
+			/* another client of the service took it: not a try */
+			if(acceptagain()) { i++; continue; }
 			dolog(param, (unsigned char *)"Connect back accept() failed");
 			continue;
 		}
@@ -84,7 +86,7 @@ void * threadfunc (void *p) {
 			continue;
 		}
 #endif
-		if(socksendto(param, param->remsock, (struct sockaddr*)&param->sinsr, (unsigned char *)"C", 1, CONNBACK_TO*1000) != 1){
+		if(socksend(param, param->remsock, (unsigned char *)"C", 1, CONNBACK_TO) != 1){
 			dolog(param, (unsigned char *)"Connect back sending command failed");
 			param->srv->so._closesocket(param->sostate, param->remsock);
 			param->remsock = INVALID_SOCKET;
@@ -221,6 +223,69 @@ char * printopts(char *sep){
 	int i=0, pos=0;
 	for(; sockopts[i].optname; i++)pos += sprintf(optsbuf+pos,"%s%s",i?sep:"",sockopts[i].optname);
 	return optsbuf;
+}
+
+
+char featsbuf[1024];
+
+/* The features of this build, by the names the manual and the test suite
+   know them, so a user can see what a binary was made with. */
+char * printfeatures(char *sep){
+	int pos=0;
+
+#define ADDFEATURE(x) pos += sprintf(featsbuf+pos,"%s%s",pos?sep:"",x)
+#ifdef WITH_SSL
+	ADDFEATURE("ssl");
+#ifdef WITH_WOLFSSL
+	ADDFEATURE("wolfssl");
+#else
+	ADDFEATURE("openssl");
+#endif
+#endif
+#ifndef NORADIUS
+	ADDFEATURE("radius");
+#endif
+#ifdef WITH_PCRE
+	ADDFEATURE("pcre");
+#endif
+#ifndef NOIPV6
+	ADDFEATURE("ipv6");
+#endif
+#ifdef WITH_UN
+	ADDFEATURE("unix");
+#endif
+#ifdef WITH_HTTPSRV
+	ADDFEATURE("httpsrv");
+#endif
+#ifdef WITH_TRANSPARENT
+	ADDFEATURE("transparent");
+#endif
+#ifdef WITH_NETFILTER
+	ADDFEATURE("netfilter");
+#endif
+#ifdef WITH_PF
+	ADDFEATURE("pf");
+#endif
+#ifdef WITH_ODBC
+	ADDFEATURE("odbc");
+#endif
+#ifdef WITH_FTP
+	ADDFEATURE("ftppr");
+#endif
+#ifdef WITH_POP3P
+	ADDFEATURE("pop3p");
+#endif
+#ifdef WITH_SMTPP
+	ADDFEATURE("smtpp");
+#endif
+#ifdef WITH_IMAPP
+	ADDFEATURE("imapp");
+#endif
+#ifndef NOPLUGINS
+	ADDFEATURE("plugins");
+#endif
+#undef ADDFEATURE
+	return featsbuf;
 }
 
 
@@ -364,6 +429,7 @@ static int srvprepare(struct srvstart *s, int argc, char **argv){
 	"    association: 1 - log, 2 - authorize, 3 - both (default), 0 (same as -U) -\n"
 	"    neither. The first destination is always authorized and logged\n"
 #endif
+	" -B split the TLS ClientHello passed through tlspr at the SNI (DPI bypass)\n"
 	"-g(GRACE_TRAFF,GRACE_NUM,GRACE_DELAY) - delay GRACE_DELAY milliseconds before polling if average polling size below  GRACE_TRAFF bytes and GRACE_NUM read operations in single directions are detected within 1 second to minimize polling\n"
 	" -fFORMAT logging format (see documentation)\n"
 	" -l log to stderr\n"
@@ -631,6 +697,13 @@ static int srvprepare(struct srvstart *s, int argc, char **argv){
 		case 'U':
 			srv->udpauth = *(argv[i]+2)? atoi(argv[i]+2) : 0;
 			break;
+		case 'B':
+			/* the TLS ClientHello split at the SNI (tlspr), which -s is
+			   where -s is not splice; s_option means something else
+			   for these */
+			if(!s->isudp && srv->service != S_ADMIN && srv->service != S_HTTPSRV)
+				srv->s_option = 1 + atoi(argv[i]+2);
+			break;
 		case 's':
 #ifdef WITHSPLICE
 			/* admin is an httpsrv, where -s is the limited mode */
@@ -705,7 +778,12 @@ static int srvprepare(struct srvstart *s, int argc, char **argv){
  else {
 #endif
 #ifndef NOPORTMAP
-	if (error || argc != i+3 || *argv[i]=='-'|| (*SAPORT(&srv->intsa) = htons((uint16_t)atoi(argv[i])))==0 || (srv->targetport = htons((uint16_t)atoi(argv[i+2])))==0) {
+	/* the port of a Unix socket target is ignored, 0 as the manual has it */
+	if (error || argc != i+3 || *argv[i]=='-'|| (*SAPORT(&srv->intsa) = htons((uint16_t)atoi(argv[i])))==0 || ((srv->targetport = htons((uint16_t)atoi(argv[i+2])))==0
+#ifdef WITH_UN
+	    && strncmp(argv[i+1], "unix:", 5)
+#endif
+	    )) {
 		fprintf(stderr, "%s of %s\n"
 			"Usage: %s options"
 			" [-e<external_ip>] <port_to_bind>"
@@ -761,6 +839,11 @@ static int srvprepare(struct srvstart *s, int argc, char **argv){
 
 /* The listening socket. A UDP one also receives the datagrams of new
    clients, so it is their client socket too. 0, or the code to exit with. */
+#ifdef WITH_UN
+static void unbound(struct srvparam *srv);
+static void ununlink(struct srvparam *srv);
+#endif
+
 static int srvlisten(struct srvstart *s){
  struct srvparam *srv = &s->srv;
  struct clientparam *defparam = &s->defparam;
@@ -815,6 +898,9 @@ static int srvlisten(struct srvstart *s){
 	sleeptime = (sleeptime<<1);
 	if(!sleeptime) return -3;
  }
+#ifdef WITH_UN
+ unbound(srv);
+#endif
 #ifndef NOTCPMAIN
  if(!s->isudp){
 	if(srv->so._listen (srv->so.state, sock, srv->backlog?srv->backlog : 1+(srv->maxchild>>3))==-1) {
@@ -851,6 +937,8 @@ static int cblisten(struct srvstart *s){
 	return -6;
  }
  setopts(srv->cbsock, &srv->cbssockopts);
+ /* the clients of the service all wait for it: one accepts what comes */
+ nonblock(srv->cbsock);
 
  if(srv->so._bind(srv->so.state, srv->cbsock, (struct sockaddr*)&cbsa, SASIZE(&cbsa))==-1) {
 	dolog(defparam, (unsigned char *)"Failed to bind connect back socket");
@@ -909,7 +997,7 @@ static int tcpnext(struct srvstart *s, SOCKET *client, int *nlog){
 		return NEXT_RETRY;
 	}
 
-	if(sockrecvfrom(NULL, new_sock,(struct sockaddr*)&defparam->sincr,buf,1,60*1000) != 1 || *buf!='C') {
+	if(sockrecvfrom(NULL, new_sock, NULL, buf, 1, 60*1000) != 1 || *buf!='C') {
 		so._closesocket(so.state, new_sock);
 		usleep(SLEEPTIME);
 		return NEXT_RETRY;
@@ -1323,6 +1411,9 @@ int WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLine, int 
  WSADATA wd;
  WSAStartup(MAKEWORD( 1, 1 ), &wd);
 
+#else
+ /* a client gone while it is written to is an error, not the end */
+ signal(SIGPIPE, SIG_IGN);
 #endif
 
  if((res = srvprepare(&s, argc, argv))) return res;
@@ -1478,13 +1569,37 @@ void srvinit2(struct srvparam * srv, struct clientparam *param){
 	param->sinsr = srv->extsa;
 }
 
+#ifdef WITH_UN
+/* A service bound to a Unix socket path notes its file, as a service of a
+   newer configuration may bind the same path before this one closes: the
+   file is then the other's, which closing must not remove. */
+static void unbound(struct srvparam *srv){
+ struct stat st;
+
+ if(*SAFAMILY(&srv->intsa) == AF_UNIX && *SAADDR(&srv->intsa) &&
+    !stat((char *)SAADDR(&srv->intsa), &st)){
+	srv->undev = (uint64_t)st.st_dev;
+	srv->unino = (uint64_t)st.st_ino;
+ }
+}
+
+static void ununlink(struct srvparam *srv){
+ struct stat st;
+
+ if(*SAFAMILY(&srv->intsa) == AF_UNIX && *SAADDR(&srv->intsa) &&
+    !stat((char *)SAADDR(&srv->intsa), &st) &&
+    (uint64_t)st.st_dev == srv->undev && (uint64_t)st.st_ino == srv->unino)
+	unlink((char *)SAADDR(&srv->intsa));
+}
+#endif
+
 void srvfree(struct srvparam * srv){
  int i;
 
  if(srv->srvsock != INVALID_SOCKET) {
     so._closesocket(srv->so.state, srv->srvsock);
 #ifdef WITH_UN
-    if(*SAFAMILY(&srv->intsa) == AF_UNIX && *SAADDR(&srv->intsa))unlink((char *)SAADDR(&srv->intsa));
+    ununlink(srv);
 #endif
  }
  srv->srvsock = INVALID_SOCKET;
@@ -1745,6 +1860,21 @@ struct ace * copyacl (struct ace *ac){
 			if(hst->name) {
 				hst->name = (unsigned char*)strdup((char *)hst->name);
 				if(!hst->name) {
+					hst->re = NULL;
+					hst->next = NULL;
+					goto ERRORDSTNAMES;
+				}
+			}
+			/* each copy compiles its own pattern, freed with it */
+			if(hst->re){
+#ifdef WITH_PCRE
+				char err[256];
+
+				hst->re = pcre_pattern_compile(hst->name, err, sizeof(err));
+#else
+				hst->re = NULL;
+#endif
+				if(!hst->re) {
 					hst->next = NULL;
 					goto ERRORDSTNAMES;
 				}
@@ -1868,9 +1998,17 @@ FILTER_ACTION makefilters (struct srvparam *srv, struct clientparam *param){
 		
 	for(i=0; i<srv->nfilters; i++){
 		if(!srv->filter[i].filter_client)continue;
+		/* the slot may hold what the connection before left in it */
+		param->filters[param->nfilters].data = NULL;
 		action = (*srv->filter[i].filter_client)(srv->filter[i].data, param, &param->filters[param->nfilters].data);
 		if(action == PASS) continue;
-		if(action > CONTINUE) return action;
+		if(action > CONTINUE) {
+			/* a filter refusing the connection is not kept, but it may
+			   have made a state for it */
+			if(srv->filter[i].filter_clear && param->filters[param->nfilters].data)
+				(*srv->filter[i].filter_clear)(param->filters[param->nfilters].data);
+			return action;
+		}
 		param->filters[param->nfilters].filter = srv->filter + i;
 		if(srv->filter[i].filter_request)param->reqfilters[param->nreqfilters++] = param->filters + param->nfilters;
 		if(srv->filter[i].filter_connect)param->connectfilters[param->nconnectfilters++] = param->filters + param->nfilters;
@@ -1911,6 +2049,9 @@ void freeacl(struct ace *ac){
 		}
 		for(hst = ac->dstnames; hst; hst = (struct hostname *)itfree(hst, hst->next)){
 			if(hst->name)free(hst->name);
+#ifdef WITH_PCRE
+			if(hst->re)pcre_pattern_free(hst->re);
+#endif
 		}
 		for(ch = ac->chains; ch; ch = (struct chain *) itfree(ch, ch->next)){
 			if(ch->extuser) free(ch->extuser);

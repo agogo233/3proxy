@@ -426,11 +426,18 @@ int
 #endif
     }
 
+/* a peer gone is an error of the send, not SIGPIPE, where the system can
+   say so for a call: SIGPIPE is ignored too, for TLS and splice() */
+#ifdef MSG_NOSIGNAL
+#define SENDFLAGS MSG_NOSIGNAL
+#else
+#define SENDFLAGS 0
+#endif
     ssize_t def_send(void* state, SOCKET s, const void *msg, size_t len, int flags){
-	return send(s, msg, len, flags);
+	return send(s, msg, len, flags | SENDFLAGS);
     }
     ssize_t def_sendto(void* state, SOCKET s, const void *msg, size_t len, int flags, const struct sockaddr *to, socklen_t tolen){
-	return sendto(s, msg, len, flags, to, tolen);
+	return sendto(s, msg, len, flags | SENDFLAGS, to, tolen);
     }
     ssize_t def_recv(void* state, SOCKET s, void *buf, size_t len, int flags){
 	return recv(s, buf, len, flags);
@@ -627,6 +634,26 @@ int parseconnusername(char *username, struct clientparam *param, int extpasswd, 
 }
 
 
+/* What waits for a socket waits in poll(): a call on it never does. */
+void nonblock(SOCKET sock){
+#ifdef _WIN32
+	unsigned long ul = 1;
+	ioctlsocket(sock, FIONBIO, &ul);
+#else
+	fcntl(sock, F_SETFL, O_NONBLOCK | fcntl(sock, F_GETFL));
+#endif
+}
+
+/* accept() with nothing to accept: another took it, or it was gone */
+int acceptagain(void){
+#ifdef _WIN32
+	int err = WSAGetLastError();
+	return err == WSAEWOULDBLOCK || err == WSAECONNRESET || err == WSAEINTR;
+#else
+	return errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNABORTED || errno == EINTR;
+#endif
+}
+
 int connectwithpoll(struct clientparam *param, SOCKET sock, struct sockaddr *sa, SASIZETYPE size, int to){
 		struct pollfd fds[1];
 #ifdef _WIN32
@@ -753,6 +780,22 @@ int doconnect(struct clientparam * param){
 	param->srv->so._setsockopt(param->sostate, param->remsock, SOL_SOCKET, SO_LINGER, (char *)&lg, sizeof(lg));
 #endif
 	if(extbindtodevice(param, param->remsock)) return 12;
+#ifdef IP_BIND_ADDRESS_NO_PORT
+	/* A port the kernel chooses is chosen by connect(), for the pair with
+	   the destination: one in use towards another destination, or closing
+	   from an earlier connection, does as well. bind() would take one of
+	   its own, and with many connections find none left, or search long
+	   for it. */
+	if((param->operation >= 256 || (param->operation & CONNECT) || param->redirected)
+# ifdef WITH_UN
+	    && *SAFAMILY(&param->sinsl) != AF_UNIX
+# endif
+	    ){
+		int one = 1;
+
+		param->srv->so._setsockopt(param->sostate, param->remsock, IPPROTO_IP, IP_BIND_ADDRESS_NO_PORT, (char *)&one, sizeof(one));
+	}
+#endif
 #ifdef WITH_UN
 	if(*SAFAMILY(&param->sinsl) != AF_UNIX)
 #endif
